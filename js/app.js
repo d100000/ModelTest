@@ -48,6 +48,7 @@ const App = {
     this._bindEvents();
     this._initTooltip();
     this._initConfigModal();
+    this._initSecurity();
     this._onFormatChange();
     const urlEl = document.getElementById('cfg-url');
     if (!urlEl.value.trim()) {
@@ -125,6 +126,321 @@ const App = {
     el.innerHTML = on.length
       ? `已启用：${on.map(n => `<span class="cfg-chip">${this._esc(n)}</span>`).join('')}`
       : '<span class="dim">未启用任何高级套件</span>';
+  },
+
+  /* ===================== 安全加固：人机校验 / 并发额度 / 心跳 / 超时兜底 ===================== */
+  _securityConst: { heartbeatMs: 10000, timeoutMinSamples: 6, timeoutRate: 0.6 },
+
+  _initSecurity() {
+    this.state.fingerprint = this._computeFingerprint();
+    ApiClient.clientFingerprint = this.state.fingerprint;
+    this.state.sessionId = null;
+    this.state.heartbeatTimer = null;
+    // 离开页面 → 释放测试额度（心跳停止后服务端也会兜底回收）
+    window.addEventListener('beforeunload', () => {
+      if (this.state.sessionId && navigator.sendBeacon) {
+        try {
+          navigator.sendBeacon('/api/session/release',
+            new Blob([JSON.stringify({ session_id: this.state.sessionId })], { type: 'application/json' }));
+        } catch (_) {}
+      }
+    });
+    document.getElementById('captcha-close')?.addEventListener('click', () => this._cancelCaptcha());
+    document.getElementById('queue-cancel')?.addEventListener('click', () => this._cancelQueue());
+    document.getElementById('queue-cancel-btn')?.addEventListener('click', () => this._cancelQueue());
+  },
+
+  _computeFingerprint() {
+    const parts = [navigator.userAgent, navigator.language, (navigator.languages || []).join(','),
+      `${screen.width}x${screen.height}x${screen.colorDepth || 0}`,
+      new Date().getTimezoneOffset(), navigator.hardwareConcurrency || 0, navigator.deviceMemory || 0];
+    try {
+      const c = document.createElement('canvas');
+      const ctx = c.getContext('2d');
+      ctx.textBaseline = 'top'; ctx.font = "14px 'Arial'";
+      ctx.fillStyle = '#f60'; ctx.fillRect(0, 0, 80, 20);
+      ctx.fillStyle = '#069'; ctx.fillText('MFT-fp-7Q3', 2, 2);
+      parts.push(c.toDataURL().slice(-48));
+    } catch (_) {}
+    let h = 0; const s = parts.join('|');
+    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+    let salt = localStorage.getItem('mft.fp.salt');
+    if (!salt) { salt = Math.random().toString(36).slice(2, 10); localStorage.setItem('mft.fp.salt', salt); }
+    return 'fp_' + h.toString(16) + salt;
+  },
+
+  async _postJson(path, body) {
+    const res = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-MFT-Fingerprint': this.state.fingerprint || '' },
+      body: JSON.stringify(body || {})
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 429) { const e = new Error(data?.error?.message || '请求过于频繁'); e.rateLimited = true; e.data = data; throw e; }
+    return data;
+  },
+
+  _showOverlay(id) { const m = document.getElementById(id); if (!m) return; m.hidden = false; requestAnimationFrame(() => m.classList.add('show')); },
+  _hideOverlay(id) { const m = document.getElementById(id); if (!m) return; m.classList.remove('show'); setTimeout(() => { m.hidden = true; }, 200); },
+
+  /** 安全闸门：人机校验 → 申请测试额度（满则排队）。返回 true 表示获得额度可以开始。 */
+  async _securityGate() {
+    let captchaToken = '';
+    try {
+      captchaToken = await this._runCaptcha();
+      if (captchaToken === null) return false; // 用户取消
+    } catch (e) {
+      captchaToken = ''; // 校验后端不可用（如纯静态托管）→ 跳过人机校验
+    }
+    let acq;
+    try {
+      acq = await this._postJson('/api/session/acquire', { captcha_token: captchaToken, fingerprint: this.state.fingerprint });
+    } catch (e) {
+      if (e.rateLimited) { this._toast(e.message, 'error'); return false; }
+      return true; // 无安全网关后端 → 直接放行（本地静态使用）
+    }
+    if (acq.status === 'running') { this.state.sessionId = acq.session_id; this._startHeartbeat(); return true; }
+    if (acq.status === 'queued') return await this._waitInQueue(acq);
+    if (acq.status === 'full') {
+      this._toast(`站点繁忙：同时测试已达上限（${acq.capacity || '?'} 个），请稍后再试`, 'error');
+      return false;
+    }
+    // 未知/无响应（如纯静态托管，无安全网关后端）→ 放行
+    return true;
+  },
+
+  // ---- 滑块人机校验 ----
+  async _runCaptcha() {
+    let ch;
+    try { ch = await this._postJson('/api/captcha/new', {}); }
+    catch (e) { throw new Error('captcha_unavailable'); }
+    if (!ch || !ch.challenge_id) throw new Error('captcha_unavailable');
+    return await new Promise((resolve) => {
+      this._captchaResolve = resolve;
+      this._renderCaptcha(ch);
+      this._showOverlay('captcha-modal');
+    });
+  },
+
+  _renderCaptcha(ch) {
+    this._captcha = { ch, pieceX: 0, samples: 0, startedAt: 0, dragging: false, solved: false };
+    const W = ch.width || 300, H = ch.height || 160, P = ch.piece || 46, gy = ch.piece_y || 30;
+    const bg = document.getElementById('captcha-bg');
+    const pc = document.getElementById('captcha-piece');
+    const badge = document.getElementById('captcha-result-badge');
+    if (badge) { badge.className = 'captcha-result-badge'; badge.textContent = ''; }
+    const status = document.getElementById('captcha-status');
+    if (status) status.textContent = '';
+    // 背景：seed 化渐变 + 缺口
+    const bctx = bg.getContext('2d');
+    bctx.clearRect(0, 0, W, H);
+    const seed = ch.seed || 1;
+    const g = bctx.createLinearGradient(0, 0, W, H);
+    g.addColorStop(0, `hsl(${seed % 360},55%,42%)`);
+    g.addColorStop(1, `hsl(${(seed * 7) % 360},55%,30%)`);
+    bctx.fillStyle = g; bctx.fillRect(0, 0, W, H);
+    for (let i = 0; i < 6; i++) {
+      bctx.fillStyle = `hsla(${(seed * (i + 3)) % 360},60%,70%,0.25)`;
+      bctx.beginPath();
+      bctx.arc((seed * (i + 1) * 53) % W, (seed * (i + 2) * 31) % H, 14 + (i * 7) % 22, 0, Math.PI * 2);
+      bctx.fill();
+    }
+    // 缺口
+    this._roundRect(bctx, ch.gap, gy, P, P, 8);
+    bctx.fillStyle = 'rgba(0,0,0,0.55)'; bctx.fill();
+    bctx.strokeStyle = 'rgba(255,255,255,0.85)'; bctx.lineWidth = 2; bctx.stroke();
+    this._drawCaptchaPiece(0);
+    this._bindCaptchaDrag();
+  },
+
+  _drawCaptchaPiece(x) {
+    const ch = this._captcha.ch;
+    const W = ch.width || 300, H = ch.height || 160, P = ch.piece || 46, gy = ch.piece_y || 30;
+    const pc = document.getElementById('captcha-piece');
+    const ctx = pc.getContext('2d');
+    ctx.clearRect(0, 0, W, H);
+    this._roundRect(ctx, x, gy, P, P, 8);
+    ctx.fillStyle = 'rgba(91,141,239,0.92)'; ctx.fill();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke();
+    this._captcha.pieceX = x;
+  },
+
+  _roundRect(ctx, x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  },
+
+  _bindCaptchaDrag() {
+    const handle = document.getElementById('captcha-slider-handle');
+    const track = document.getElementById('captcha-slider');
+    const fill = document.getElementById('captcha-slider-fill');
+    const label = document.getElementById('captcha-slider-label');
+    if (!handle || !track) return;
+    const ch = this._captcha.ch;
+    const W = ch.width || 300, P = ch.piece || 46;
+    const maxPieceX = W - P;
+    let startX = 0, originLeft = 0;
+
+    const onMove = (clientX) => {
+      const trackW = track.clientWidth, handleW = handle.offsetWidth;
+      let left = Math.max(0, Math.min(trackW - handleW, originLeft + (clientX - startX)));
+      handle.style.left = left + 'px';
+      if (fill) fill.style.width = (left + handleW / 2) + 'px';
+      const frac = left / (trackW - handleW);
+      this._drawCaptchaPiece(Math.round(frac * maxPieceX));
+      this._captcha.samples++;
+    };
+    const down = (e) => {
+      if (this._captcha.solved) return;
+      this._captcha.dragging = true;
+      this._captcha.samples = 0;
+      this._captcha.startedAt = Date.now();
+      startX = (e.touches ? e.touches[0].clientX : e.clientX);
+      originLeft = parseFloat(handle.style.left || '0');
+      if (label) label.style.opacity = '0';
+      e.preventDefault();
+    };
+    const move = (e) => { if (this._captcha.dragging) onMove(e.touches ? e.touches[0].clientX : e.clientX); };
+    const up = () => {
+      if (!this._captcha.dragging) return;
+      this._captcha.dragging = false;
+      this._submitCaptcha();
+    };
+    // 重新绑定：先移除旧的
+    handle.onmousedown = down; handle.ontouchstart = down;
+    window.onmousemove = move; window.ontouchmove = move;
+    window.onmouseup = up; window.ontouchend = up;
+    this._captchaCleanup = () => {
+      handle.onmousedown = null; handle.ontouchstart = null;
+      window.onmousemove = null; window.ontouchmove = null;
+      window.onmouseup = null; window.ontouchend = null;
+      handle.style.left = '0'; if (fill) fill.style.width = '0';
+      if (label) label.style.opacity = '';
+    };
+  },
+
+  async _submitCaptcha() {
+    const cap = this._captcha;
+    if (!cap || cap.solved) return;
+    const status = document.getElementById('captcha-status');
+    const badge = document.getElementById('captcha-result-badge');
+    let res;
+    try {
+      res = await this._postJson('/api/captcha/verify', {
+        challenge_id: cap.ch.challenge_id,
+        position: cap.pieceX,
+        duration_ms: Date.now() - cap.startedAt,
+        samples: cap.samples
+      });
+    } catch (e) {
+      if (status) status.textContent = e.rateLimited ? e.message : '验证服务暂不可用';
+      return;
+    }
+    if (res.ok && res.token) {
+      cap.solved = true;
+      if (badge) { badge.className = 'captcha-result-badge ok'; badge.textContent = '✓ 验证通过'; }
+      setTimeout(() => {
+        this._captchaCleanup && this._captchaCleanup();
+        this._hideOverlay('captcha-modal');
+        const resolve = this._captchaResolve; this._captchaResolve = null;
+        resolve && resolve(res.token);
+      }, 450);
+    } else {
+      if (badge) { badge.className = 'captcha-result-badge fail'; badge.textContent = '✗ 验证失败，请重试'; }
+      // 取一个新挑战，重置滑块
+      try {
+        const ch = await this._postJson('/api/captcha/new', {});
+        setTimeout(() => { this._captchaCleanup && this._captchaCleanup(); this._renderCaptcha(ch); }, 600);
+      } catch (_) {}
+    }
+  },
+
+  _cancelCaptcha() {
+    this._captchaCleanup && this._captchaCleanup();
+    this._hideOverlay('captcha-modal');
+    const resolve = this._captchaResolve; this._captchaResolve = null;
+    resolve && resolve(null);
+  },
+
+  // ---- 排队 ----
+  async _waitInQueue(initial) {
+    this.state.sessionId = initial.session_id;  // 排队期间也要心跳，否则被回收
+    document.getElementById('queue-position').textContent = `排在第 ${initial.position} 位`;
+    document.getElementById('queue-stats').textContent = `运行中 ${initial.active}/${initial.capacity} · 排队 ${initial.queued || 1}`;
+    this._showOverlay('queue-modal');
+    return await new Promise((resolve) => {
+      this._queueResolve = resolve;
+      this._queueTimer = setInterval(async () => {
+        if (!this.state.sessionId) return;
+        let r;
+        try { r = await this._postJson('/api/session/heartbeat', { session_id: this.state.sessionId }); }
+        catch (_) { return; }
+        if (r.status === 'running') {
+          clearInterval(this._queueTimer); this._queueTimer = null;
+          this._hideOverlay('queue-modal');
+          this._startHeartbeat();
+          const res = this._queueResolve; this._queueResolve = null; res && res(true);
+        } else if (r.status === 'queued') {
+          const pos = document.getElementById('queue-position');
+          if (pos) pos.textContent = `排在第 ${r.position} 位`;
+        } else { // expired
+          clearInterval(this._queueTimer); this._queueTimer = null;
+          this._hideOverlay('queue-modal');
+          this._toast('排队会话已超时，请重新开始', 'warn');
+          this.state.sessionId = null;
+          const res = this._queueResolve; this._queueResolve = null; res && res(false);
+        }
+      }, 3000);
+    });
+  },
+
+  _cancelQueue() {
+    if (this._queueTimer) { clearInterval(this._queueTimer); this._queueTimer = null; }
+    this._hideOverlay('queue-modal');
+    this._releaseSession();
+    const res = this._queueResolve; this._queueResolve = null; res && res(false);
+  },
+
+  // ---- 心跳 / 释放 ----
+  _startHeartbeat() {
+    this._stopHeartbeat();
+    this.state.heartbeatTimer = setInterval(async () => {
+      if (!this.state.sessionId) return;
+      try { await this._postJson('/api/session/heartbeat', { session_id: this.state.sessionId }); } catch (_) {}
+    }, this._securityConst.heartbeatMs);
+  },
+
+  _stopHeartbeat() {
+    if (this.state.heartbeatTimer) { clearInterval(this.state.heartbeatTimer); this.state.heartbeatTimer = null; }
+  },
+
+  async _releaseSession() {
+    this._stopHeartbeat();
+    const sid = this.state.sessionId;
+    this.state.sessionId = null;
+    if (!sid) return;
+    try { await this._postJson('/api/session/release', { session_id: sid }); } catch (_) {}
+  },
+
+  /** 超时兜底：完成样本足够且超时率过高时自动停止测试并释放额度 */
+  _checkTimeoutHealth() {
+    if (!this.state.running) return;
+    if (this.state.abortController?.signal.aborted) return;
+    const done = this.state.results;
+    const c = this._securityConst;
+    if (done.length < c.timeoutMinSamples) return;
+    const timeouts = done.filter(r => r.error && (r.error.code === -1 || /timeout|timed out|超时|aborted/i.test(r.error.message || ''))).length;
+    const rate = timeouts / done.length;
+    if (rate >= c.timeoutRate) {
+      this.state.abortedDueToTimeouts = true;
+      this._toast(`接口稳定性较差（超时率 ${(rate * 100).toFixed(0)}%，${timeouts}/${done.length}），已自动停止测试并释放额度。`, 'error');
+      try { this.state.abortController.abort(); } catch (_) {}
+    }
   },
 
   _onCacheToggle() {
@@ -811,9 +1127,14 @@ Please respond concisely to the user's question, keeping answers under three sho
     });
     if (!tasks.length) return this._toast('任务数为 0', 'error');
 
+    // 安全闸门：人机校验 + 申请测试额度（满则排队）。未获得额度则不开始。
+    const gateOk = await this._securityGate();
+    if (!gateOk) return;
+
     // 每次点击「开始测试」都先彻底清空上一轮的全部结果与分析面板，
     // 避免上一轮启用、本轮关闭的测试套件（缓存/思考/多模态/参数/对抗等）残留旧数据。
     this._clearResults();
+    this.state.abortedDueToTimeouts = false;
 
     const totalTurns = tasks.reduce((a, t) => a + t.turns.length, 0);
     let completedTurns = 0;
@@ -854,6 +1175,7 @@ Please respond concisely to the user's question, keeping answers under three sho
           this._updateRunProgress({ completedTurns });
           this._onProbeTurnComplete(task, turn, result);
           this._updateMetricsLive();
+          this._checkTimeoutHealth();  // 超时兜底：超时率过高自动停止
         },
         onTaskComplete: (task) => this._onProbeTaskComplete(task),
         onSkipParam: (param, errMsg) => {
@@ -899,7 +1221,11 @@ Please respond concisely to the user's question, keeping answers under three sho
 
       const dur = ((Date.now() - startedAt) / 1000).toFixed(1);
       this._updateRunProgress({ completedTurns, done: true, durationText: `${dur}s` });
-      this._toast(`测试完成，共 ${this.state.results.length} 条响应`, 'success');
+      if (this.state.abortedDueToTimeouts) {
+        this._toast(`测试已中止：接口稳定性较差导致未能完成（已完成 ${this.state.results.length} 条）。已释放测试额度。`, 'error');
+      } else {
+        this._toast(`测试完成，共 ${this.state.results.length} 条响应`, 'success');
+      }
     } catch (e) {
       this._toast('运行异常: ' + e.message, 'error');
     } finally {
@@ -910,6 +1236,7 @@ Please respond concisely to the user's question, keeping answers under three sho
         try { this.state.abortController.abort(); } catch (_) {}
       }
       this.state.abortController = null;
+      this._releaseSession();  // 释放测试额度（并发槽位）
       try { this._analyzeAndRender(); } catch (e) {
         this._toast('分析渲染异常: ' + e.message, 'error');
       }

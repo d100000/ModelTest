@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>模型保真测试 · Model Fidelity Tester</title>
-<link rel="stylesheet" href="styles.css?v=56" />
+<link rel="stylesheet" href="styles.css?v=57" />
 </head>
 <body>
 <header class="app-header">
@@ -780,6 +780,47 @@
 <!-- Toast 容器 -->
 <div id="toast-container"></div>
 
+<!-- 🛡 人机验证（滑块）弹框 -->
+<div id="captcha-modal" class="modal-overlay" hidden>
+  <div class="modal-card captcha-card" role="dialog" aria-modal="true" aria-label="人机验证">
+    <header class="modal-head">
+      <h2>🛡 人机验证</h2>
+      <button class="modal-close" id="captcha-close" title="取消">✕</button>
+    </header>
+    <div class="modal-body">
+      <p class="captcha-tip">拖动下方滑块，把拼图块移动到缺口处完成验证</p>
+      <div class="captcha-stage" id="captcha-stage">
+        <canvas id="captcha-bg" width="300" height="160"></canvas>
+        <canvas id="captcha-piece" class="captcha-piece" width="300" height="160"></canvas>
+        <div class="captcha-result-badge" id="captcha-result-badge"></div>
+      </div>
+      <div class="captcha-slider" id="captcha-slider">
+        <div class="captcha-slider-fill" id="captcha-slider-fill"></div>
+        <div class="captcha-slider-handle" id="captcha-slider-handle">⇢</div>
+        <span class="captcha-slider-label" id="captcha-slider-label">向右拖动滑块</span>
+      </div>
+      <div class="captcha-status" id="captcha-status"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ⏳ 排队弹框（并发已满） -->
+<div id="queue-modal" class="modal-overlay" hidden>
+  <div class="modal-card queue-card" role="dialog" aria-modal="true" aria-label="排队中">
+    <header class="modal-head">
+      <h2>⏳ 排队中</h2>
+      <button class="modal-close" id="queue-cancel" title="取消排队">✕</button>
+    </header>
+    <div class="modal-body">
+      <div class="queue-spinner"></div>
+      <p class="queue-text">当前测试并发已满，您正在排队等待空位…</p>
+      <div class="queue-position" id="queue-position">排在第 — 位</div>
+      <div class="dim" id="queue-stats" style="margin-top:8px;font-size:12px"></div>
+      <button class="btn btn-ghost" id="queue-cancel-btn" style="margin-top:14px">取消排队</button>
+    </div>
+  </div>
+</div>
+
 <!-- ⚙ 测试配置弹框（高级测试套件运行时被移入这里） -->
 <div id="config-modal" class="modal-overlay" hidden>
   <div class="modal-card" role="dialog" aria-modal="true" aria-label="测试配置">
@@ -794,13 +835,13 @@
   </div>
 </div>
 
-<script src="js/prompts.js?v=56"></script>
-<script src="js/fingerprints.js?v=56"></script>
-<script src="js/channels.js?v=56"></script>
-<script src="js/scorecard.js?v=56"></script>
-<script src="js/analyzer.js?v=56"></script>
-<script src="js/api.js?v=56"></script>
-<script src="js/charts.js?v=56"></script>
-<script src="js/app.js?v=56"></script>
+<script src="js/prompts.js?v=57"></script>
+<script src="js/fingerprints.js?v=57"></script>
+<script src="js/channels.js?v=57"></script>
+<script src="js/scorecard.js?v=57"></script>
+<script src="js/analyzer.js?v=57"></script>
+<script src="js/api.js?v=57"></script>
+<script src="js/charts.js?v=57"></script>
+<script src="js/app.js?v=57"></script>
 </body>
 </html>

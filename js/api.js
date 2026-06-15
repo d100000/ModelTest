@@ -750,6 +750,8 @@ const ApiClient = {
       };
     }
     if (opts.extraHeaders) Object.assign(headers, opts.extraHeaders);
+    // 设备指纹（仅本地后端消费，用于限流/会话；不在 FORWARD_PREFIXES 中，不会转发到上游）
+    if (this.clientFingerprint) headers['X-MFT-Fingerprint'] = this.clientFingerprint;
     return headers;
   },
 

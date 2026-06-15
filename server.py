@@ -11,8 +11,10 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 import gzip
+import ipaddress
 import json
 import os
+import socket
 import threading
 import time
 import urllib.error
@@ -21,10 +23,23 @@ import urllib.request
 import zlib
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
+import security
+
 try:
     import brotli  # type: ignore
 except Exception:  # noqa: BLE001 - optional runtime dependency.
     brotli = None
+
+
+# Security / capacity hardening singletons (configured at startup in main()).
+SECURITY_CONFIG: dict = security.load_config()
+CAPTCHA = security.CaptchaService(SECURITY_CONFIG)
+SESSIONS = security.SessionManager(SECURITY_CONFIG)
+RATE_LIMITER = security.RateLimiter(SECURITY_CONFIG)
+
+# Max body for non-proxy control endpoints (captcha/session). Proxy bodies may
+# be large (1M-context tests), so the cap only applies to control endpoints.
+CONTROL_MAX_BODY = 16 * 1024
 
 
 HOP_BY_HOP = {
@@ -94,13 +109,136 @@ class ProxyStaticHandler(SimpleHTTPRequestHandler):
         if self.path.startswith("/api/health"):
             self._send_json(200, {"ok": True, "service": "mft-local-backend"})
             return
+        if self.path.startswith("/api/session/stats"):
+            self._send_json(200, SESSIONS.stats())
+            return
         super().do_GET()
 
     def do_POST(self) -> None:
         if self._is_proxy_path():
             self._handle_proxy("POST")
             return
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/api/captcha/new":
+            self._handle_captcha_new()
+            return
+        if path == "/api/captcha/verify":
+            self._handle_captcha_verify()
+            return
+        if path == "/api/session/acquire":
+            self._handle_session_acquire()
+            return
+        if path == "/api/session/heartbeat":
+            self._handle_session_heartbeat()
+            return
+        if path == "/api/session/release":
+            self._handle_session_release()
+            return
         self.send_error(404, "Not found")
+
+    # ------------------------------------------------------------------ #
+    # Security helpers
+    # ------------------------------------------------------------------ #
+    def _client_ip(self) -> str:
+        fwd = self.headers.get("X-Forwarded-For")
+        if fwd:
+            return fwd.split(",")[0].strip()
+        try:
+            return self.client_address[0]
+        except Exception:  # noqa: BLE001
+            return "?"
+
+    def _client_key(self) -> str:
+        return security.client_key(self._client_ip(), self.headers.get("X-MFT-Fingerprint"))
+
+    def _read_control_body(self) -> dict | None:
+        length = int(self.headers.get("Content-Length") or "0")
+        if length > CONTROL_MAX_BODY:
+            self._send_json(413, {"error": {"message": "请求体过大"}})
+            return None
+        raw = self.rfile.read(length) if length > 0 else b"{}"
+        try:
+            return json.loads(raw.decode("utf-8") or "{}")
+        except (ValueError, UnicodeDecodeError):
+            self._send_json(400, {"error": {"message": "请求体不是合法 JSON"}})
+            return None
+
+    def _rate_guard(self, bucket: str) -> bool:
+        """Return True if allowed; otherwise emit 429 and return False."""
+        key = self._client_key()
+        res = RATE_LIMITER.check(key, bucket)
+        if res["allowed"]:
+            return True
+        msg = "请求过于频繁，已被临时封禁" if res.get("banned") else "请求过于频繁，请稍后再试"
+        self._send_json(429, {"error": {"message": msg, "type": "rate_limited",
+                                        "retry_after": res["retry_after"]}},
+                        {"Retry-After": str(res["retry_after"])})
+        return False
+
+    def _handle_captcha_new(self) -> None:
+        if not self._rate_guard("captcha"):
+            return
+        if self._read_control_body() is None:
+            return
+        self._send_json(200, CAPTCHA.new_challenge())
+
+    def _handle_captcha_verify(self) -> None:
+        if not self._rate_guard("captcha"):
+            return
+        body = self._read_control_body()
+        if body is None:
+            return
+        res = CAPTCHA.verify(
+            str(body.get("challenge_id", "")),
+            body.get("position", -999),
+            body.get("duration_ms", 0),
+            body.get("samples", 0),
+        )
+        self._send_json(200 if res.get("ok") else 400, res)
+
+    def _handle_session_acquire(self) -> None:
+        if not self._rate_guard("start"):
+            return
+        body = self._read_control_body()
+        if body is None:
+            return
+        if SECURITY_CONFIG.get("captcha_required", True):
+            if not CAPTCHA.consume_token(str(body.get("captcha_token", ""))):
+                self._send_json(403, {"error": {"message": "人机校验未通过或已过期，请重新验证",
+                                                "type": "captcha_required"}})
+                return
+        result = SESSIONS.acquire(self._client_key())
+        status = 200 if result.get("status") in {"running", "queued"} else 503
+        self._send_json(status, result)
+
+    def _handle_session_heartbeat(self) -> None:
+        body = self._read_control_body()
+        if body is None:
+            return
+        self._send_json(200, SESSIONS.heartbeat(str(body.get("session_id", ""))))
+
+    def _handle_session_release(self) -> None:
+        body = self._read_control_body()
+        if body is None:
+            return
+        self._send_json(200, SESSIONS.release(str(body.get("session_id", ""))))
+
+    def _target_is_private(self, host: str) -> bool:
+        """SSRF guard: does the proxy target resolve to a private/loopback IP?"""
+        hostname = host.split(":")[0]
+        try:
+            infos = socket.getaddrinfo(hostname, None)
+        except Exception:  # noqa: BLE001 - unresolved host: let upstream fail normally.
+            return False
+        for info in infos:
+            addr = info[4][0]
+            try:
+                ip = ipaddress.ip_address(addr.split("%")[0])
+            except ValueError:
+                continue
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                return True
+        return False
 
     def _handle_proxy(self, method: str) -> None:
         parsed = urllib.parse.urlparse(self.path)
@@ -112,6 +250,16 @@ class ProxyStaticHandler(SimpleHTTPRequestHandler):
         target_url = urllib.parse.urlparse(target)
         if target_url.scheme not in {"https", "http"} or not target_url.netloc:
             self._send_json(400, {"error": {"message": "Invalid proxy target"}})
+            return
+
+        # Anti-abuse: per-client sliding-window rate limit on the proxy.
+        if not self._rate_guard("proxy"):
+            return
+
+        # SSRF guard (configurable): block proxying to internal/loopback hosts.
+        if SECURITY_CONFIG.get("block_private_targets") and self._target_is_private(target_url.netloc):
+            self._send_json(403, {"error": {"message": "出于安全策略，禁止代理到内网/本地地址",
+                                            "type": "ssrf_blocked"}})
             return
 
         body = None
@@ -334,6 +482,16 @@ def main() -> None:
     server = ThreadingHTTPServer((args.host, args.port), ProxyStaticHandler)
     print(f"Serving Model Fidelity Tester on http://{args.host}:{args.port}/index.html")
     print("Local API endpoint: /api/proxy?target=https%3A%2F%2Fexample.com%2Fv1%2Fmessages")
+    print(
+        "Security: max_concurrent_tests={mc} queue={q} heartbeat_timeout={hb}s "
+        "captcha={cap} block_private_targets={bp}".format(
+            mc=SECURITY_CONFIG["max_concurrent_tests"],
+            q=SECURITY_CONFIG["queue_enabled"],
+            hb=SECURITY_CONFIG["heartbeat_timeout_seconds"],
+            cap=SECURITY_CONFIG["captcha_required"],
+            bp=SECURITY_CONFIG.get("block_private_targets", False),
+        )
+    )
     server.serve_forever()
 
 

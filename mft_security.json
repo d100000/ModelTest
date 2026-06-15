@@ -1,0 +1,31 @@
+{
+  "_comment": "站点安全/容量加固配置。改完无需改代码，重启 server.py 生效。也可用 MFT_* 环境变量覆盖部分项。",
+
+  "max_concurrent_tests": 100,
+  "queue_enabled": true,
+  "max_queue": 500,
+
+  "heartbeat_timeout_seconds": 30,
+  "session_max_seconds": 3600,
+
+  "captcha_required": true,
+  "captcha_token_ttl_seconds": 300,
+  "captcha_tolerance_px": 8,
+  "captcha_min_drag_ms": 250,
+  "captcha_max_drag_ms": 20000,
+  "captcha_min_samples": 6,
+
+  "_block_private_targets_note": "公网部署建议设为 true，阻止用本代理 SSRF 扫描内网；本地测试本地模型需设为 false。",
+  "block_private_targets": false,
+
+  "rate_limit": {
+    "proxy_window_seconds": 10,
+    "proxy_max_per_window": 150,
+    "start_window_seconds": 60,
+    "start_max_per_window": 10,
+    "captcha_window_seconds": 60,
+    "captcha_max_per_window": 40,
+    "ban_seconds": 120,
+    "ban_threshold": 3
+  }
+}

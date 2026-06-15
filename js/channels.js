@@ -58,6 +58,7 @@ const CHANNEL_FINGERPRINTS = [
       { weight: 15, type: 'body_field',   path: 'model', regex: /-v\d+:\d+$/i, label: 'body.model 含 Bedrock 版本后缀 -vN:N' },
       // === URL ===
       { weight: 18, type: 'url_host',     regex: /bedrock-runtime\.[a-z0-9-]+\.amazonaws\.com$/i, label: 'URL host 是 bedrock-runtime.<region>.amazonaws.com' },
+      { weight: 18, type: 'url_host',     regex: /bedrock-mantle\.[a-z0-9-]+\.api\.aws$/i, label: 'URL host 是 bedrock-mantle.<region>.api.aws（新版 Bedrock 集成）' },
       { weight: 8,  type: 'url_path',     regex: /\/model\/.+\/invoke/i, label: 'URL 含 /model/.../invoke' }
     ]
   },
@@ -92,6 +93,18 @@ const CHANNEL_FINGERPRINTS = [
       { weight: 50, type: 'body_field_exists', path: 'agentContinuationID', label: 'body 含 agentContinuationID' },
       { weight: 50, type: 'body_field_exists', path: 'assistantResponseMessage', label: 'body 含 assistantResponseMessage（CodeWhisperer）' },
       { weight: 35, type: 'body_field_exists', path: 'chatTriggerType', label: 'body 含 chatTriggerType（CodeWhisperer）' },
+      { weight: 40, type: 'body_field_exists', path: 'utteranceId', label: 'body 含 utteranceId（CodeWhisperer schema）' },
+      { weight: 40, type: 'body_field_exists', path: 'supplementaryWebLinks', label: 'body 含 supplementaryWebLinks（CodeWhisperer）' },
+      // 合成 message id：kiro2api 用 14 位时间戳，kiro-gateway 用 24 位 hex（官方为 base62，不是纯 hex/时间戳）
+      { weight: 55, type: 'body_field', path: 'id', regex: /^msg_20\d{12}/, label: 'body.id 含 14 位时间戳（kiro2api 合成 id）' },
+      { weight: 42, type: 'body_field', path: 'id', regex: /^msg_[0-9a-f]{24}$/i, label: 'body.id = msg_ + 24 位 hex（kiro-gateway 合成 id，官方为 base62）' },
+      { weight: 35, type: 'body_array_field', arrayPath: 'content', path: 'id', regex: /^toolu_[0-9a-f]{24}$/i, label: 'tool_use id = toolu_ + 24 位 hex（合成，官方为 base62）' },
+      // 模型目录命名 tells：auto / 点分小版本（claude-sonnet-4.5）
+      { weight: 45, type: 'body_field', path: 'model', regex: /^(?:auto|auto-kiro)$/i, label: 'body.model 为 auto / auto-kiro（Kiro 路由命名）' },
+      { weight: 30, type: 'body_field', path: 'model', regex: /^claude-(?:sonnet|opus|haiku)-\d+\.\d+/i, label: 'body.model 用点分小版本（claude-sonnet-4.5 风格，Kiro 目录命名）' },
+      // AWS 后端头 tells（即便 body 规整为 Anthropic 格式，网关头常透传）
+      { weight: 30, type: 'response_header_exists', key: 'x-amzn-codewhisperer-optout', label: '响应含 x-amzn-codewhisperer-optout（Kiro 专属）' },
+      { weight: 28, type: 'response_header_exists', key: 'x-amzn-kiro-agent-mode', label: '响应含 x-amzn-kiro-agent-mode（Kiro 专属）' },
       // 注：曾有一条"body.model 是 claude-xxx-4-6+ 即判 Kiro"的规则，前提是"4-6+ 版本号官方公共 API 不存在"。
       //     该前提已失效——claude-sonnet-4-6 / claude-opus-4-6/4-7/4-8 均为 Anthropic 官方公共模型，
       //     该规则会把每个当前 Claude 模型误判成 Kiro，故移除。Kiro 的真实指纹是大写下划线命名
@@ -123,7 +136,13 @@ const CHANNEL_FINGERPRINTS = [
       // 关键：用域名标签边界锚定，避免旧版 `.*clove.*` 这类裸子串误命中（如 clover-ai.com）。
       // 权重也从 100 下调，使单一 host 模糊命中不会无脑压过官方 body 指纹（官方满命中约 115）。
       { weight: 70, type: 'url_host', regex: /(?:^|\.)claude\.ai$/i, label: 'URL host 是 claude.ai 或其子域（Claude.ai 网页端）' },
-      { weight: 55, type: 'url_host', regex: /(?:^|[.\-_])(?:claude2api|clove|claude-relay|claude-mirror)(?:[.\-_]|$)/i, label: 'URL host 命中已知 Claude 逆向/镜像项目（按域名标签边界匹配）' },
+      { weight: 55, type: 'url_host', regex: /(?:^|[.\-_])(?:claude2api|clove|clewdr|clewd|claude-relay|claude-mirror)(?:[.\-_]|$)/i, label: 'URL host 命中已知 Claude 逆向/镜像项目（按域名标签边界匹配）' },
+      // 网页逆向合成 id：裸 UUIDv4（claude2api/clewdr 用 uuid.New()，官方为 msg_+base62）
+      { weight: 45, type: 'body_field', path: 'id', regex: /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i, label: 'body.id 是裸 UUIDv4（网页逆向合成，非 msg_ 前缀）' },
+      // stop_reason 用 OpenAI 风格的 "stop"（官方 Claude 只会是 end_turn / max_tokens / ...）
+      { weight: 35, type: 'body_field', path: 'stop_reason', regex: /^stop$/, label: 'body.stop_reason = "stop"（OpenAI 风格，官方 Claude 用 end_turn）' },
+      // claude2api 默认回显固定旧模型，与请求模型无关
+      { weight: 22, type: 'body_field', path: 'model', regex: /^claude-3-7-sonnet-20250219$/, label: 'body.model 恒为 claude-3-7-sonnet-20250219（claude2api 默认值）' },
       { weight: 15, type: 'body_field', path: 'id', regex: /^(?!msg_01|msg_vrtx_|msg_bdrk_|msq_bdrk_).+/, label: 'body.id 不是公开 API/Vertex/Bedrock 前缀' }
     ],
     requiresClaude: true
@@ -141,6 +160,8 @@ const CHANNEL_FINGERPRINTS = [
       { weight: 80, type: 'body_field',   path: 'model', regex: /^(?:anthropic|claude)\//i, label: 'body.model 含 vendor/ 前缀（OpenRouter 命名）' },
       { weight: 35, type: 'body_field',   path: 'id', regex: /^gen-[A-Za-z0-9]/i, label: 'body.id 形如 gen-...（OpenRouter 生成）' },
       { weight: 18, type: 'body_field_exists', path: 'provider', label: 'body.provider 存在（OpenRouter 特有）' },
+      { weight: 16, type: 'body_field_exists', path: 'provider_name', label: 'body.provider_name 存在（OpenRouter 计费元数据）' },
+      { weight: 14, type: 'body_field_exists', path: 'total_cost', label: 'body.total_cost 存在（OpenRouter 返回美元成本，官方 API 从不返回）' },
       // === body / url ===
       { weight: 25, type: 'url_host',     regex: /openrouter\.ai$/i, label: 'URL host = openrouter.ai' },
       { weight: 10, type: 'body_field_exists', path: 'usage.cost', label: 'usage.cost 存在（OpenRouter 常见扩展）' }
