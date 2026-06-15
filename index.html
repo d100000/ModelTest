@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>模型保真测试 · Model Fidelity Tester</title>
-<link rel="stylesheet" href="styles.css?v=54" />
+<link rel="stylesheet" href="styles.css?v=56" />
 </head>
 <body>
 <header class="app-header">
@@ -136,9 +136,24 @@
       </div>
     </section>
 
-    <section class="card">
+    <!-- ② 高级测试套件入口（详细配置在弹框里） -->
+    <section class="card" id="config-trigger-card">
       <header class="card-header">
         <h2>② 高级测试套件 <span class="hint" style="font-weight:400;font-size:11px">· 可选</span></h2>
+      </header>
+      <div class="card-body">
+        <button class="btn btn-block btn-config-open" id="btn-open-config">⚙ 打开测试配置…</button>
+        <div class="dim" style="font-size:11px;margin-top:8px;line-height:1.6">
+          缓存 · 对话连续性 · 思考链 · 预设/多模态 · 参数透传 · 对抗探针 · 容量能力（含 1M 上下文）等高级测试，点击展开配置弹框。
+        </div>
+        <div id="config-trigger-summary" class="config-trigger-summary"></div>
+      </div>
+    </section>
+
+    <!-- 高级测试套件（运行时被移入配置弹框） -->
+    <section class="card" id="advanced-suite-card">
+      <header class="card-header">
+        <h2>高级测试套件 <span class="hint" style="font-weight:400;font-size:11px">· 可选</span></h2>
       </header>
       <div class="card-body">
         <!-- 缓存率测试 -->
@@ -267,6 +282,28 @@
             <span class="dim" style="font-size:11px;display:block;margin-left:24px">运行身份强制、伪 system/developer、泄露、编码绕过和 TRAP 后缀探测</span>
           </span>
         </label>
+
+        <label class="suite-toggle">
+          <input type="checkbox" id="cfg-capacity-enable" />
+          <span class="toggle-label">
+            <strong>容量能力测试</strong>
+            <span class="dim" style="font-size:11px;display:block;margin-left:24px">探测真实上下文上限（含 1M）与最大输出长度，综合判断模型档位与是否为受限中转（Kiro/CodeWhisperer 类后端）</span>
+          </span>
+        </label>
+        <div id="capacity-config-box" class="suite-config" style="display:none">
+          <label class="suite-toggle">
+            <input type="checkbox" id="cfg-context-test-enable" checked />
+            <span class="toggle-label"><strong>上下文强度</strong><span class="dim" style="font-size:11px;display:block;margin-left:24px">阶梯式增大上下文（2K→16K→64K→200K），埋入 needle 口令测召回与真实可接受上限</span></span>
+          </label>
+          <label class="suite-toggle">
+            <input type="checkbox" id="cfg-context-1m-enable" />
+            <span class="toggle-label"><strong>测试 1M 上下文</strong><span class="dim" style="font-size:11px;display:block;margin-left:24px">额外发送 ~1M token（约 4MB，较慢/较贵），附带 anthropic-beta: context-1m-2025-08-07，验证是否真支持百万上下文</span></span>
+          </label>
+          <label class="suite-toggle">
+            <input type="checkbox" id="cfg-output-test-enable" checked />
+            <span class="toggle-label"><strong>最大输出长度</strong><span class="dim" style="font-size:11px;display:block;margin-left:24px">请求超长连续输出，测实际产出 token 与是否被低位封顶（中转降级常见）</span></span>
+          </label>
+        </div>
       </div>
     </section>
 
@@ -371,6 +408,11 @@
         <div class="metric-value" id="m-adversarial">—</div>
         <div class="metric-sub" id="m-adversarial-sub">未启用</div>
       </div>
+      <div class="metric-card" id="capacity-card" style="display:none">
+        <div class="metric-label">容量能力</div>
+        <div class="metric-value" id="m-capacity">—</div>
+        <div class="metric-sub" id="m-capacity-sub">未启用</div>
+      </div>
     </section>
 
     <!-- 标签页 -->
@@ -385,6 +427,7 @@
       <button class="tab" data-tab="multimodal" id="multimodal-tab-btn" style="display:none">多模态</button>
       <button class="tab" data-tab="params" id="param-tab-btn" style="display:none">参数透传</button>
       <button class="tab" data-tab="adversarial" id="adversarial-tab-btn" style="display:none">对抗探针</button>
+      <button class="tab" data-tab="capacity" id="capacity-tab-btn" style="display:none">容量能力</button>
       <button class="tab" data-tab="stats">📈 统计图表</button>
     </div>
 
@@ -676,6 +719,18 @@
         </div>
       </div>
 
+      <div class="tab-panel" id="tab-capacity">
+        <div class="card">
+          <header class="card-header">
+            <h3>容量能力测试</h3>
+            <span class="hint">真实上下文上限 + 1M 支持 + 最大输出长度 → 综合推断模型档位与渠道</span>
+          </header>
+          <div class="card-body" id="capacity-analysis">
+            <div class="empty-state">运行容量能力测试后显示</div>
+          </div>
+        </div>
+      </div>
+
       <!-- 统计图表 -->
       <div class="tab-panel" id="tab-stats">
         <div class="stats-grid">
@@ -725,13 +780,27 @@
 <!-- Toast 容器 -->
 <div id="toast-container"></div>
 
-<script src="js/prompts.js?v=54"></script>
-<script src="js/fingerprints.js?v=54"></script>
-<script src="js/channels.js?v=54"></script>
-<script src="js/scorecard.js?v=54"></script>
-<script src="js/analyzer.js?v=54"></script>
-<script src="js/api.js?v=54"></script>
-<script src="js/charts.js?v=54"></script>
-<script src="js/app.js?v=54"></script>
+<!-- ⚙ 测试配置弹框（高级测试套件运行时被移入这里） -->
+<div id="config-modal" class="modal-overlay" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-label="测试配置">
+    <header class="modal-head">
+      <h2>⚙ 测试配置</h2>
+      <button class="modal-close" id="btn-close-config" title="关闭 (Esc)">✕</button>
+    </header>
+    <div class="modal-body" id="config-modal-body"></div>
+    <footer class="modal-foot">
+      <button class="btn btn-primary" id="btn-config-done">完成</button>
+    </footer>
+  </div>
+</div>
+
+<script src="js/prompts.js?v=56"></script>
+<script src="js/fingerprints.js?v=56"></script>
+<script src="js/channels.js?v=56"></script>
+<script src="js/scorecard.js?v=56"></script>
+<script src="js/analyzer.js?v=56"></script>
+<script src="js/api.js?v=56"></script>
+<script src="js/charts.js?v=56"></script>
+<script src="js/app.js?v=56"></script>
 </body>
 </html>

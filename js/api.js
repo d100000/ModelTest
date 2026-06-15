@@ -533,6 +533,20 @@ const ApiClient = {
     });
   },
 
+  /**
+   * 服务端 web_search 工具测试体（Anthropic 专属服务端工具）。
+   * 官方 API 支持 type:"web_search_20250305"；Bedrock/Vertex/Kiro/网页逆向 多数不支持，
+   * 因此能否真正触发 server_tool_use / web_search_tool_result 是强力的"是否官方直连"判据。
+   */
+  _buildWebSearchBody(model, prompt, opts) {
+    return JSON.stringify({
+      model,
+      max_tokens: opts.maxTokens || 1024,
+      messages: [{ role: 'user', content: prompt }],
+      tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 2 }]
+    });
+  },
+
   _buildThinkingReplayBody(model, originalPrompt, previousBlocks, followupPrompt, opts, mode = 'adaptive') {
     const safeBlocks = (previousBlocks || [])
       .filter(b => b && (b.type === 'thinking' || b.type === 'redacted_thinking' || b.type === 'text'))

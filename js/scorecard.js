@@ -437,6 +437,20 @@ const SCORECARD_CHECKS = [
     }
   },
   {
+    id: 'l3_web_search', layer: 'L3', name: 'Web Search 服务端工具', weight: 6,
+    desc: '官方 web_search_20250305 服务端联网搜索能否真正触发（强力的官方直连判据）',
+    evaluate(ctx) {
+      if (!ctx.cfg.paramTestEnabled) return { status: 'skip', detail: '未启用参数透传测试' };
+      if (ctx.cfg.format !== 'anthropic') return { status: 'skip', detail: '仅 Anthropic 协议支持' };
+      const r = ctx.paramResults?.webSearch;
+      if (!r) return { status: 'skip', detail: 'Web Search 未运行' };
+      if (r.skipped) return { status: 'skip', detail: r.error?.message || '跳过' };
+      if (r.webSearchStatus === 'pass') return { status: 'pass', detail: r.paramDetail };
+      if (r.webSearchStatus === 'partial') return { status: 'partial', detail: r.paramDetail };
+      return { status: 'fail', detail: r.paramDetail || '后端不支持 web_search 服务端工具' };
+    }
+  },
+  {
     id: 'l3_stop_sequences', layer: 'L3', name: 'stop_sequences 透传', weight: 4,
     desc: '检测 stop_sequences / stop 参数是否被上游执行',
     evaluate(ctx) {
@@ -489,6 +503,48 @@ const SCORECARD_CHECKS = [
       if (r.tempRejected) return { status: 'pass', detail: r.paramDetail || '服务端拒绝 temperature=0.5 → 符合 Opus 4.7+ 行为' };
       if (r.tempAccepted) return { status: 'fail', detail: r.paramDetail || '声称 Opus 4.7+ 但接受了 temperature=0.5 → 疑似 Sonnet/Haiku 或旧版本' };
       return { status: 'partial', detail: r.paramDetail || '请求未成功，无法判定 temperature 限制' };
+    }
+  },
+  {
+    id: 'l3_context_capacity', layer: 'L3', name: '上下文真实上限', weight: 7,
+    desc: '阶梯式增大上下文并用 needle 召回，判断真实可接受上下文上限',
+    evaluate(ctx) {
+      if (!ctx.cfg.capacityEnabled || !ctx.cfg.contextTestEnabled) return { status: 'skip', detail: '未启用上下文强度测试' };
+      const c = ctx.capacityResults?.context;
+      if (!c) return { status: 'skip', detail: '上下文测试未运行' };
+      if (c.error) return { status: 'fail', detail: '测试失败: ' + c.error };
+      const k = c.maxRecalled || c.maxAccepted || 0;
+      const fmt = (t) => t >= 1e6 ? (t / 1e6) + 'M' : (t / 1000) + 'K';
+      if (k >= 200000) return { status: 'pass', detail: `可召回上下文上限 ≈ ${fmt(k)}，符合官方大窗口` };
+      if (k >= 64000) return { status: 'partial', detail: `可召回上下文上限 ≈ ${fmt(k)}，低于官方 200K` };
+      return { status: 'fail', detail: `上下文上限仅 ≈ ${fmt(Math.max(k, c.maxAccepted))}，疑似受限中转/降级` };
+    }
+  },
+  {
+    id: 'l3_context_1m', layer: 'L3', name: '1M 上下文支持', weight: 6,
+    desc: '附带 anthropic-beta: context-1m，验证是否真支持百万级上下文',
+    evaluate(ctx) {
+      if (!ctx.cfg.capacityEnabled || !ctx.cfg.context1mEnabled) return { status: 'skip', detail: '未启用 1M 上下文测试' };
+      const c = ctx.capacityResults?.context;
+      if (!c || c.error || !c.tested1m) return { status: 'skip', detail: '1M 测试未运行' };
+      if (c.supports1m) return { status: 'pass', detail: '1M 档 needle 成功召回，真支持百万上下文' };
+      const s1m = (c.steps || []).find(s => s.tokens === 1e6);
+      if (s1m?.accepted) return { status: 'partial', detail: '1M 档接受但未召回 needle，疑似静默截断' };
+      return { status: 'fail', detail: '1M 档被拒绝，不支持百万上下文' };
+    }
+  },
+  {
+    id: 'l3_output_capacity', layer: 'L3', name: '最大输出长度', weight: 5,
+    desc: '请求超长输出，检测是否被低位封顶（中转降级常见）',
+    evaluate(ctx) {
+      if (!ctx.cfg.capacityEnabled || !ctx.cfg.outputTestEnabled) return { status: 'skip', detail: '未启用输出长度测试' };
+      const o = ctx.capacityResults?.output;
+      if (!o) return { status: 'skip', detail: '输出长度测试未运行' };
+      if (o.error) return { status: 'fail', detail: '测试失败: ' + o.error };
+      const cappedLow = o.truncated && o.outTokens < o.requestedMax * 0.4 && o.outTokens < 1200;
+      if (cappedLow) return { status: 'fail', detail: `输出仅 ${o.outTokens}t 即被截断，疑似低位封顶/降级` };
+      if (o.outTokens >= o.requestedMax * 0.6) return { status: 'pass', detail: `产出 ${o.outTokens}t，输出容量正常` };
+      return { status: 'partial', detail: `产出 ${o.outTokens}t（finish=${o.finish}）` };
     }
   },
 

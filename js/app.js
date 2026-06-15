@@ -6,8 +6,9 @@ const DEFAULT_CONCURRENCY = 10;
 const RUN_PRESETS = {
   safe: { label: '稳妥', concurrency: 4, timeout: 180, hint: '稳妥：并发 4，适合容易 502 或限流的中转站。' },
   balanced: { label: '均衡', concurrency: 10, timeout: 180, hint: '均衡：并发 10，适合大多数中转站。' },
-  fast: { label: '极速', concurrency: 20, timeout: 240, hint: '极速：并发 20，适合稳定、额度充足的中转站。' }
+  fast: { label: '极速压测', concurrency: 32, timeout: 240, hint: '极速压测：并发 32，大量并发探测接口稳定性/限流（默认）。注意本地后端按上游域名限流，可调大 MFT_UPSTREAM_CONCURRENCY 提升真实压力。' }
 };
+const DEFAULT_RUN_PRESET = 'fast';  // #3 默认开启极速压测
 
 const App = {
 
@@ -25,6 +26,7 @@ const App = {
     paramResults: {},      // { stopSequences, outputFormat, thinkingDisplay }
     adversarialResults: [],
     adversarialSummary: null,
+    capacityResults: null,  // { context: {...}, output: {...}, channelHint, modelHint }
     availableModels: [],
     running: false,
     abortController: null,
@@ -35,6 +37,7 @@ const App = {
   /** ========== 初始化 ========== */
   init() {
     this.state.prompts = PromptStore.load();
+    const hadSavedConfig = !!localStorage.getItem('mft.config');
     this._loadConfig();
     const proxyEl = document.getElementById('cfg-local-proxy-enable');
     if (proxyEl) {
@@ -43,19 +46,85 @@ const App = {
     }
     this._renderPrompts();
     this._bindEvents();
+    this._initTooltip();
+    this._initConfigModal();
     this._onFormatChange();
     const urlEl = document.getElementById('cfg-url');
     if (!urlEl.value.trim()) {
       urlEl.value = ApiClient.defaultUrl(document.getElementById('cfg-format').value);
     }
-    // 缓存系统提示初始化
+    // 缓存系统提示初始化（#6：默认用大上下文前缀，缓存命中更明显）
     const cacheSysEl = document.getElementById('cfg-cache-system');
     if (!cacheSysEl.value.trim()) {
-      cacheSysEl.value = this._defaultCacheSystem;
+      cacheSysEl.value = this._buildLargeCacheSystem();
     }
+    // #3：首次使用默认开启「极速压测」预设
+    if (!hadSavedConfig) this._applyRunPreset(DEFAULT_RUN_PRESET);
     this._onCacheToggle();
     this._updateCacheTokenCount();
     this._updateTotalRequests();
+  },
+
+  /** #6 构造大上下文缓存前缀：把基础参考文档确定性地扩展到 ~8K token，缓存命中更显著 */
+  _buildLargeCacheSystem() {
+    const base = this._defaultCacheSystem;
+    const sections = [base];
+    // 追加确定性扩展段落（同一文本稳定可缓存），目标 ~8K token
+    for (let i = 1; i <= 4; i++) {
+      sections.push(
+        `\n\n# Appendix ${i}: Extended Reference Notes (stable cache padding block ${i})\n` +
+        base.split('\n').slice(2).join('\n')
+      );
+    }
+    return sections.join('');
+  },
+
+  /** #1 把「高级测试套件」卡片移入弹框，左栏只留入口按钮 */
+  _initConfigModal() {
+    const card = document.getElementById('advanced-suite-card');
+    const body = document.getElementById('config-modal-body');
+    const modal = document.getElementById('config-modal');
+    if (!card || !body || !modal) return;
+    body.appendChild(card);          // 运行时把套件卡片搬进弹框（ID 全部保持不变）
+    card.classList.add('in-modal');
+
+    document.getElementById('btn-open-config')?.addEventListener('click', () => this._openConfigModal());
+    document.getElementById('btn-close-config')?.addEventListener('click', () => this._closeConfigModal());
+    document.getElementById('btn-config-done')?.addEventListener('click', () => this._closeConfigModal());
+    modal.addEventListener('click', (e) => { if (e.target === modal) this._closeConfigModal(); });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !modal.hidden) this._closeConfigModal(); });
+    this._updateConfigSummary();
+  },
+
+  _openConfigModal() {
+    const m = document.getElementById('config-modal');
+    if (!m) return;
+    m.hidden = false;
+    requestAnimationFrame(() => m.classList.add('show'));
+  },
+
+  _closeConfigModal() {
+    const m = document.getElementById('config-modal');
+    if (!m) return;
+    m.classList.remove('show');
+    setTimeout(() => { m.hidden = true; }, 200);
+    this._updateConfigSummary();
+    this._saveConfig();
+  },
+
+  /** 在入口卡片上汇总「已开启了哪些套件」 */
+  _updateConfigSummary() {
+    const el = document.getElementById('config-trigger-summary');
+    if (!el) return;
+    const map = [
+      ['cfg-cache-enable', '缓存'], ['cfg-conv-enable', '对话连续性'], ['cfg-thinking-enable', '思考链'],
+      ['cfg-preset-enable', '预设'], ['cfg-multimodal-enable', '多模态'], ['cfg-param-test-enable', '参数透传'],
+      ['cfg-adversarial-enable', '对抗探针'], ['cfg-capacity-enable', '容量能力']
+    ];
+    const on = map.filter(([id]) => document.getElementById(id)?.checked).map(([, name]) => name);
+    el.innerHTML = on.length
+      ? `已启用：${on.map(n => `<span class="cfg-chip">${this._esc(n)}</span>`).join('')}`
+      : '<span class="dim">未启用任何高级套件</span>';
   },
 
   _onCacheToggle() {
@@ -91,6 +160,16 @@ const App = {
     const e7 = document.getElementById('cfg-adversarial-enable')?.checked;
     document.getElementById('adversarial-card').style.display = e7 ? '' : 'none';
     document.getElementById('adversarial-tab-btn').style.display = e7 ? '' : 'none';
+
+    const e8 = document.getElementById('cfg-capacity-enable')?.checked;
+    const capBox = document.getElementById('capacity-config-box');
+    if (capBox) capBox.style.display = e8 ? 'block' : 'none';
+    const capCard = document.getElementById('capacity-card');
+    if (capCard) capCard.style.display = e8 ? '' : 'none';
+    const capTab = document.getElementById('capacity-tab-btn');
+    if (capTab) capTab.style.display = e8 ? '' : 'none';
+
+    this._updateConfigSummary();
   },
 
   /** 简单估算 token 数: 1 token ≈ 4 chars 英文 / 2 chars 中文混合 */
@@ -118,7 +197,8 @@ const App = {
     'cfg-thinking-enable', 'cfg-thinking-budget',
     'cfg-preset-enable', 'cfg-multimodal-enable', 'cfg-pdf-test-enable',
     'cfg-param-test-enable', 'cfg-output-format-test-enable', 'cfg-thinking-display-test-enable',
-    'cfg-adversarial-enable'],
+    'cfg-adversarial-enable',
+    'cfg-capacity-enable', 'cfg-context-test-enable', 'cfg-context-1m-enable', 'cfg-output-test-enable'],
 
   /**
    * 缓存测试脚本 — 多轮简短对话，只为触发滚动缓存命中
@@ -330,7 +410,11 @@ Please respond concisely to the user's question, keeping answers under three sho
       paramTestEnabled: document.getElementById('cfg-param-test-enable')?.checked || false,
       outputFormatTestEnabled: document.getElementById('cfg-output-format-test-enable')?.checked || false,
       thinkingDisplayTestEnabled: document.getElementById('cfg-thinking-display-test-enable')?.checked || false,
-      adversarialEnabled: document.getElementById('cfg-adversarial-enable')?.checked || false
+      adversarialEnabled: document.getElementById('cfg-adversarial-enable')?.checked || false,
+      capacityEnabled: document.getElementById('cfg-capacity-enable')?.checked || false,
+      contextTestEnabled: document.getElementById('cfg-context-test-enable')?.checked || false,
+      context1mEnabled: document.getElementById('cfg-context-1m-enable')?.checked || false,
+      outputTestEnabled: document.getElementById('cfg-output-test-enable')?.checked || false
     };
   },
 
@@ -398,12 +482,13 @@ Please respond concisely to the user's question, keeping answers under three sho
     el.textContent = '本地后端请求: /api/proxy → ' + normalized;
   },
 
-  async _loadModels() {
+  async _loadModels(opts = {}) {
+    const auto = !!opts.auto;
     const hint = document.getElementById('model-list-hint');
     const sel = document.getElementById('cfg-model-list');
     const cfg = this._getConfig();
-    if (!cfg.url) return this._toast('请先填写 API Base URL', 'warn');
-    if (!cfg.apiKey) return this._toast('请先填写 API Key', 'warn');
+    if (!cfg.url) return auto ? null : this._toast('请先填写 API Base URL', 'warn');
+    if (!cfg.apiKey) return auto ? null : this._toast('请先填写 API Key', 'warn');
     hint.className = 'url-preview changed';
     hint.textContent = '正在读取模型列表...';
     try {
@@ -424,14 +509,33 @@ Please respond concisely to the user's question, keeping answers under three sho
       sel.style.display = '';
       hint.className = 'url-preview changed';
       hint.textContent = `已读取 ${this.state.availableModels.length} 个模型，可按住 Cmd/Ctrl 多选 · ${out.url} · 本地后端`;
-      this._toast(`已读取 ${this.state.availableModels.length} 个模型`, 'success');
+      if (!auto) this._toast(`已读取 ${this.state.availableModels.length} 个模型`, 'success');
       this._updateTotalRequests();
     } catch (err) {
       sel.style.display = 'none';
       hint.className = 'url-preview warn';
-      hint.textContent = '读取失败: ' + err.message;
-      this._toast('模型列表读取失败: ' + err.message, 'error');
+      hint.textContent = (auto ? '自动读取失败: ' : '读取失败: ') + err.message;
+      if (!auto) this._toast('模型列表读取失败: ' + err.message, 'error');
     }
+  },
+
+  /** #2 地址+Key 完整即自动拉取模型列表（防抖，无需手动点按钮） */
+  _maybeAutoLoadModels() {
+    clearTimeout(this._autoLoadTimer);
+    const url = (document.getElementById('cfg-url')?.value || '').trim();
+    const key = (document.getElementById('cfg-key')?.value || '').trim();
+    // 完整性校验：URL 形如 http(s)://host.tld，Key 至少 8 位（避免半截触发）
+    const urlOk = /^https?:\/\/[^\s./]+\.[^\s]+/i.test(url) || /^https?:\/\/localhost(:\d+)?/i.test(url);
+    const keyOk = key.length >= 8;
+    const hint = document.getElementById('model-list-hint');
+    if (!urlOk || !keyOk) return;
+    const sig = url + ' ' + key + ' ' + (document.getElementById('cfg-format')?.value || '');
+    if (sig === this._lastAutoLoadSig) return;  // 同一组合不重复拉取
+    if (hint) { hint.className = 'url-preview changed'; hint.textContent = '检测到完整地址与 Key，准备自动读取模型…'; }
+    this._autoLoadTimer = setTimeout(() => {
+      this._lastAutoLoadSig = sig;
+      this._loadModels({ auto: true });
+    }, 800);
   },
 
   /** ========== 提示词渲染 ========== */
@@ -519,7 +623,11 @@ Please respond concisely to the user's question, keeping answers under three sho
       if (!cur || cur === DEFAULT_URLS.openai || cur === DEFAULT_URLS.anthropic) {
         this._resetUrl();
       }
+      this._maybeAutoLoadModels();
     });
+
+    // #2 API Key 不进入 _configIds（不持久化），单独绑定以触发自动读取模型
+    document.getElementById('cfg-key')?.addEventListener('input', () => this._maybeAutoLoadModels());
 
     document.getElementById('btn-reset-url').addEventListener('click', e => {
       e.preventDefault();
@@ -534,8 +642,10 @@ Please respond concisely to the user's question, keeping answers under three sho
     ['cfg-cache-enable', 'cfg-conv-enable', 'cfg-thinking-enable', 'cfg-preset-enable',
       'cfg-multimodal-enable', 'cfg-pdf-test-enable', 'cfg-param-test-enable',
       'cfg-output-format-test-enable', 'cfg-thinking-display-test-enable',
-      'cfg-adversarial-enable'].forEach(id => {
-      document.getElementById(id).addEventListener('change', () => {
+      'cfg-adversarial-enable',
+      'cfg-capacity-enable', 'cfg-context-test-enable', 'cfg-context-1m-enable', 'cfg-output-test-enable'].forEach(id => {
+      const elx = document.getElementById(id);
+      if (elx) elx.addEventListener('change', () => {
         this._onCacheToggle();
         this._saveConfig();
       });
@@ -579,6 +689,7 @@ Please respond concisely to the user's question, keeping answers under three sho
         this._saveConfig();
         this._updateTotalRequests();
         if (id === 'cfg-url' || id === 'cfg-local-proxy-enable') this._updateUrlPreview();
+        if (id === 'cfg-url') this._maybeAutoLoadModels();
         if (id === 'cfg-concurrency' || id === 'cfg-timeout') this._syncRunPresetUI();
       });
       el.addEventListener('change', () => {
@@ -700,6 +811,10 @@ Please respond concisely to the user's question, keeping answers under three sho
     });
     if (!tasks.length) return this._toast('任务数为 0', 'error');
 
+    // 每次点击「开始测试」都先彻底清空上一轮的全部结果与分析面板，
+    // 避免上一轮启用、本轮关闭的测试套件（缓存/思考/多模态/参数/对抗等）残留旧数据。
+    this._clearResults();
+
     const totalTurns = tasks.reduce((a, t) => a + t.turns.length, 0);
     let completedTurns = 0;
 
@@ -753,7 +868,8 @@ Please respond concisely to the user's question, keeping answers under three sho
         cfg.presetEnabled ? ['预设提示词', () => this._runPresetPromptTest(cfg)] : null,
         cfg.multimodalEnabled ? ['多模态', () => this._runMultimodalTest(cfg)] : null,
         cfg.paramTestEnabled ? ['参数透传', () => this._runParamTests(cfg)] : null,
-        cfg.adversarialEnabled ? ['对抗探针', () => this._runAdversarialProbes(cfg)] : null
+        cfg.adversarialEnabled ? ['对抗探针', () => this._runAdversarialProbes(cfg)] : null,
+        cfg.capacityEnabled ? ['容量能力', () => this._runCapacityTests(cfg)] : null
       ].filter(Boolean);
 
       const suiteStatus = new Map(suiteJobs.map(([name]) => [name, '运行中']));
@@ -1348,10 +1464,19 @@ Please respond concisely to the user's question, keeping answers under three sho
       return;
     }
     const meta = { id: 'thinking_1', promptId: 'thinking', promptTag: 'thinking', promptTitle: '思考链探测', promptBody: this._thinkingPrompt, round: 1, concurrencyIndex: 0, testType: 'thinking' };
+    // #4 实时显示：测试进行时把请求 + 流式思考/回答即时呈现在思考链面板
+    this._renderThinkingLive();
+    const onStreamChunk = cfg.stream ? (chunk) => {
+      if (!chunk || !chunk.text) return;
+      const id = chunk.type === 'thinking' ? 'thinking-live-think' : 'thinking-live-answer';
+      const el = document.getElementById(id);
+      if (el) { el.classList.add('streaming'); el.textContent += chunk.text; el.scrollTop = el.scrollHeight; }
+    } : null;
+    const sendOpts = onStreamChunk ? Object.assign({}, cfg, { onStreamChunk }) : cfg;
     const send = (mode) => ApiClient.sendCustom(
       meta,
-      ApiClient._buildThinkingBody(cfg.model, this._thinkingPrompt, cfg, mode),
-      cfg,
+      ApiClient._buildThinkingBody(cfg.model, this._thinkingPrompt, sendOpts, mode),
+      sendOpts,
       this.state.abortController.signal
     );
     // 先发 adaptive（现代 Claude：Opus 4.6+/4.7/4.8、Fable 5、Sonnet 4.6），
@@ -1488,6 +1613,249 @@ Please respond concisely to the user's question, keeping answers under three sho
     const partial = results.filter(r => r.adversarialStatus === 'partial').length;
     const fail = results.filter(r => r.adversarialStatus === 'fail').length;
     return { total, pass, partial, fail, score: total ? (pass + partial * 0.5) / total : 0 };
+  },
+
+  /** ========== 容量能力测试（上下文强度 含 1M + 输出长度） ========== */
+  async _runCapacityTests(cfg) {
+    const signal = this.state.abortController?.signal;
+    const result = { context: null, output: null, channelHint: null, modelHint: null, notes: [] };
+    this.state.capacityResults = result;
+
+    if (cfg.outputTestEnabled && !signal?.aborted) {
+      try { result.output = await this._runOutputLengthTest(cfg, signal); }
+      catch (e) { result.output = { error: e.message }; }
+    }
+    if (cfg.contextTestEnabled && !signal?.aborted) {
+      try { result.context = await this._runContextStrengthTest(cfg, signal); }
+      catch (e) { result.context = { error: e.message }; }
+    }
+    this._deriveCapacityHints(result);
+    return result;
+  },
+
+  async _runOutputLengthTest(cfg, signal) {
+    const requestedMax = 4096;
+    const prompt = 'Output a numbered list starting at 1, exactly one integer per line (1, newline, 2, newline, 3 ...). Keep counting upward as far as you can with no words, no headings, no summary — only the bare numbers. Do not stop early.';
+    const opts = Object.assign({}, cfg, { stream: false, maxTokens: requestedMax, temperature: null });
+    const body = cfg.format === 'anthropic'
+      ? ApiClient._buildAnthropicBody(cfg.model, prompt, opts)
+      : ApiClient._buildOpenAIBody(cfg.model, prompt, opts);
+    const r = await ApiClient.sendCustom(
+      { id: 'cap_output', promptId: 'cap_output', promptTag: 'capacity', promptTitle: '最大输出长度', promptBody: prompt, testType: 'capacity_output' },
+      body, opts, signal
+    );
+    const outTokens = Number(r.outputTokens || 0);
+    const finish = String(r.finishReason || '');
+    const truncated = /max_tokens|length/i.test(finish);
+    let maxNum = 0;
+    for (const m of String(r.content || '').matchAll(/\b(\d{1,7})\b/g)) {
+      const n = +m[1]; if (n > maxNum && n < 1e7) maxNum = n;
+    }
+    return {
+      requestedMax, outTokens, finish, truncated, maxNum,
+      status: r.response?.status || r.error?.code || 0,
+      channel: (!r.error && r.response) ? ChannelDetector.summarize(r) : null,
+      error: r.error?.message || null
+    };
+  },
+
+  async _runContextStrengthTest(cfg, signal) {
+    const tiers = [
+      { tokens: 2000, label: '2K' },
+      { tokens: 16000, label: '16K' },
+      { tokens: 64000, label: '64K' },
+      { tokens: 200000, label: '200K' }
+    ];
+    if (cfg.context1mEnabled) tiers.push({ tokens: 1000000, label: '1M', beta: true });
+
+    const needle = 'MFT-NEEDLE-' + Math.random().toString(36).slice(2, 8).toUpperCase();
+    const steps = [];
+    let maxAccepted = 0, maxRecalled = 0, supports1m = null;
+
+    for (const tier of tiers) {
+      if (signal?.aborted) break;
+      const step = await this._runOneContextTier(cfg, tier, needle, signal);
+      steps.push(step);
+      if (step.accepted) maxAccepted = Math.max(maxAccepted, tier.tokens);
+      if (step.recalled) maxRecalled = Math.max(maxRecalled, tier.tokens);
+      if (tier.tokens === 1000000) supports1m = step.accepted && step.recalled;
+      // 某档因「上下文过长」被拒，更大的档没必要再试
+      if (step.rejectedForLength) break;
+    }
+    return { needle, steps, maxAccepted, maxRecalled, supports1m, tested1m: !!cfg.context1mEnabled };
+  },
+
+  async _runOneContextTier(cfg, tier, needle, signal) {
+    const filler = this._buildFillerText(tier.tokens, needle);
+    const prompt = `${filler}\n\n=== TASK ===\nA unique passcode is hidden somewhere in the document above. It looks like "MFT-NEEDLE-XXXXXX". Reply with ONLY that passcode and nothing else.`;
+    const opts = Object.assign({}, cfg, { stream: false, maxTokens: 40, temperature: null });
+    if (tier.beta) opts.extraHeaders = Object.assign({}, cfg.extraHeaders, { 'anthropic-beta': 'context-1m-2025-08-07' });
+    const body = cfg.format === 'anthropic'
+      ? ApiClient._buildAnthropicBody(cfg.model, prompt, opts)
+      : ApiClient._buildOpenAIBody(cfg.model, prompt, opts);
+    const r = await ApiClient.sendCustom(
+      { id: `cap_ctx_${tier.label}`, promptId: `cap_ctx_${tier.label}`, promptTag: 'capacity', promptTitle: `上下文 ${tier.label}`, promptBody: `(${tier.label} needle 召回)`, testType: 'capacity_context' },
+      body, opts, signal
+    );
+    const ok = !!(r.response && r.response.ok);
+    const status = r.response?.status || r.error?.code || 0;
+    const errText = (r.error?.message || '') + ' ' + String(r.response?.body || '').slice(0, 400);
+    const rejectedForLength = !ok && /(context|token|length|too\s*long|maximum|exceed|prompt is too|413|too many)/i.test(errText);
+    const recalled = ok && new RegExp(needle.replace(/[-]/g, '\\-?'), 'i').test(r.content || '');
+    const serverInput = Number(r.inputTokens || 0);
+    const estInput = this._estimateTokens(prompt);
+    const silentTrunc = ok && serverInput > 0 && estInput > 8000 && serverInput < estInput * 0.5;
+    return {
+      label: tier.label, tokens: tier.tokens, beta: !!tier.beta,
+      accepted: ok, status, rejectedForLength, recalled, serverInput, estInput, silentTrunc,
+      latency: r.latency || 0,
+      answer: ok ? String(r.content || '').trim().slice(0, 60) : '',
+      error: r.error?.message || (ok ? null : `HTTP ${status}`)
+    };
+  },
+
+  /** 生成约 targetTokens 的填充文本，needle 埋在中间（1 token ≈ 4 英文字符） */
+  _buildFillerText(targetTokens, needle) {
+    const targetChars = targetTokens * 4;
+    const base = 'The quarterly maintenance log records routine telemetry from sector ';
+    const parts = [];
+    let len = 0, i = 0;
+    while (len < targetChars) {
+      const line = `${base}${i % 9973} at offset ${i}; status nominal, drift ${i % 7}.\n`;
+      parts.push(line);
+      len += line.length;
+      i++;
+    }
+    const mid = Math.floor(parts.length / 2);
+    parts.splice(mid, 0, `\n>>> IMPORTANT RECORD: The secret passcode is ${needle}. Remember it exactly. <<<\n`);
+    return parts.join('');
+  },
+
+  _fmtTokens(t) {
+    if (!t) return '0';
+    if (t >= 1e6) return (t / 1e6) + 'M';
+    if (t >= 1000) return (t / 1000) + 'K';
+    return String(t);
+  },
+
+  /** 综合上下文/输出能力，推断渠道与模型档位 */
+  _deriveCapacityHints(result) {
+    const ctx = result.context, out = result.output;
+    const notes = [];
+    let channelHint = null, modelHint = null;
+
+    if (ctx && !ctx.error && ctx.steps?.length) {
+      if (ctx.tested1m) {
+        if (ctx.supports1m) notes.push(`✅ 真支持 1M 上下文：needle 在 1M 档成功召回`);
+        else {
+          const s1m = ctx.steps.find(s => s.tokens === 1e6);
+          notes.push(`❌ 不支持 1M 上下文：1M 档${s1m?.accepted ? '接受但未召回 needle（疑似截断）' : '被拒绝'}`);
+        }
+      }
+      notes.push(`实测可接受上下文上限 ≈ ${this._fmtTokens(ctx.maxAccepted)}（needle 召回上限 ≈ ${this._fmtTokens(ctx.maxRecalled)}）`);
+      const silent = ctx.steps.find(s => s.silentTrunc);
+      if (silent) notes.push(`⚠ ${silent.label} 档疑似静默截断：服务端 input_tokens=${silent.serverInput} 远小于发出量 ≈ ${silent.estInput}`);
+      if (ctx.maxAccepted <= 32000) channelHint = '上下文上限偏低（≤32K）：疑似受限中转 / Kiro·CodeWhisperer 类后端或被降级，而非官方大窗口通道';
+      else if (ctx.maxAccepted < 200000) channelHint = '上下文上限低于官方 200K：疑似中转限制或非满血模型';
+    }
+
+    if (out && !out.error) {
+      if (out.truncated) notes.push(`输出在 ${out.outTokens} token 处被 ${out.finish} 截断（请求上限 ${out.requestedMax}），最大计数到 ${out.maxNum}`);
+      else notes.push(`输出 ${out.outTokens} token 后自行停止（finish=${out.finish}），最大计数到 ${out.maxNum}`);
+      if (out.truncated && out.outTokens < out.requestedMax * 0.4 && out.outTokens < 1200) {
+        const h = `输出被低位封顶（~${out.outTokens}t）：常见于中转降级 / 廉价后端`;
+        channelHint = channelHint ? channelHint + '；' + h : h;
+      }
+    }
+
+    if (ctx && ctx.maxAccepted >= 1e6) modelHint = '具备百万级上下文，符合官方 1M 档 Claude 特征';
+    else if (ctx && ctx.maxAccepted >= 200000) modelHint = '具备 ≥200K 上下文，符合官方标准 Claude 窗口';
+
+    result.notes = notes;
+    result.channelHint = channelHint;
+    result.modelHint = modelHint;
+  },
+
+  _renderCapacityAnalysis(cfg) {
+    const el = document.getElementById('capacity-analysis');
+    const mv = document.getElementById('m-capacity');
+    const ms = document.getElementById('m-capacity-sub');
+    if (!el) return;
+    const cap = this.state.capacityResults;
+    if (!cfg.capacityEnabled || !cap) {
+      el.innerHTML = '<div class="empty-state">未启用容量能力测试</div>';
+      if (mv) mv.textContent = '—';
+      if (ms) ms.textContent = cfg.capacityEnabled ? '无数据' : '未启用';
+      return;
+    }
+
+    const ctx = cap.context, out = cap.output;
+    let html = '';
+
+    // 综合推断
+    if (cap.channelHint || cap.modelHint) {
+      html += `<div class="capacity-hint-box">
+        <div class="capacity-hint-title">综合推断</div>
+        ${cap.modelHint ? `<div class="cap-hint cap-hint-model">🧩 模型档位：${this._esc(cap.modelHint)}</div>` : ''}
+        ${cap.channelHint ? `<div class="cap-hint cap-hint-channel">🛰 渠道推断：${this._esc(cap.channelHint)}</div>` : ''}
+      </div>`;
+    }
+
+    // 上下文阶梯
+    if (ctx) {
+      if (ctx.error) {
+        html += `<div class="detail-section"><div class="detail-section-title"><span>上下文强度</span></div><div class="empty-state" style="padding:10px">测试失败：${this._esc(ctx.error)}</div></div>`;
+      } else {
+        html += `<div class="detail-section">
+          <div class="detail-section-title"><span>上下文强度阶梯（needle=${this._esc(ctx.needle)}）</span></div>
+          <table class="capacity-table">
+            <thead><tr><th>档位</th><th>可接受</th><th>needle 召回</th><th>服务端 input_tokens</th><th>延迟</th><th>备注</th></tr></thead>
+            <tbody>
+            ${ctx.steps.map(s => `
+              <tr>
+                <td><b>${this._esc(s.label)}</b>${s.beta ? ' <span class="cap-tag">1M beta</span>' : ''}</td>
+                <td>${s.accepted ? '<span class="cap-ok">✓ 接受</span>' : `<span class="cap-no">✗ ${s.rejectedForLength ? '上下文过长被拒' : 'HTTP ' + s.status}</span>`}</td>
+                <td>${!s.accepted ? '—' : s.recalled ? '<span class="cap-ok">✓ 命中</span>' : '<span class="cap-warn">✗ 未召回</span>'}</td>
+                <td class="mono">${s.accepted ? (s.serverInput || '—') : '—'}${s.silentTrunc ? ' <span class="cap-warn">截断?</span>' : ''}</td>
+                <td class="mono">${s.accepted ? s.latency + 'ms' : '—'}</td>
+                <td class="dim">${s.accepted && s.answer ? this._esc(s.answer) : this._esc(s.error || '')}</td>
+              </tr>`).join('')}
+            </tbody>
+          </table>
+          <div class="capacity-summary">可接受上限 ≈ <b>${this._fmtTokens(ctx.maxAccepted)}</b> · 召回上限 ≈ <b>${this._fmtTokens(ctx.maxRecalled)}</b>${ctx.tested1m ? ` · 1M 支持：${ctx.supports1m ? '<span class="cap-ok">是</span>' : '<span class="cap-no">否</span>'}` : ` · <span class="dim">未测 1M（可在配置开启）</span>`}</div>
+        </div>`;
+      }
+    }
+
+    // 输出长度
+    if (out) {
+      if (out.error) {
+        html += `<div class="detail-section"><div class="detail-section-title"><span>最大输出长度</span></div><div class="empty-state" style="padding:10px">测试失败：${this._esc(out.error)}</div></div>`;
+      } else {
+        const cappedLow = out.truncated && out.outTokens < out.requestedMax * 0.4 && out.outTokens < 1200;
+        html += `<div class="detail-section">
+          <div class="detail-section-title"><span>最大输出长度</span></div>
+          <div class="capacity-out-grid">
+            <div class="cap-kv"><span class="k">请求上限</span><span class="v mono">${out.requestedMax} t</span></div>
+            <div class="cap-kv"><span class="k">实际产出</span><span class="v mono ${cappedLow ? 'cap-no' : 'cap-ok'}">${out.outTokens} t</span></div>
+            <div class="cap-kv"><span class="k">结束原因</span><span class="v mono">${this._esc(out.finish || '—')}</span></div>
+            <div class="cap-kv"><span class="k">最大计数</span><span class="v mono">${out.maxNum}</span></div>
+          </div>
+          ${cappedLow ? '<div class="cap-hint cap-hint-channel" style="margin-top:8px">⚠ 输出被低位封顶，疑似中转降级 / 廉价后端</div>' : ''}
+        </div>`;
+      }
+    }
+
+    el.innerHTML = html || '<div class="empty-state">无容量数据</div>';
+
+    // 指标卡
+    if (mv) mv.textContent = ctx && !ctx.error ? this._fmtTokens(ctx.maxAccepted) : (out && !out.error ? out.outTokens + 't' : '—');
+    if (ms) {
+      const bits = [];
+      if (ctx && ctx.tested1m) bits.push('1M ' + (ctx.supports1m ? '✓' : '✗'));
+      if (out && !out.error) bits.push('输出 ' + out.outTokens + 't');
+      ms.textContent = bits.join(' · ') || '已测';
+    }
   },
 
   _estimateVisibleRequestTokens(prompt, format) {
@@ -1696,7 +2064,55 @@ Please respond concisely to the user's question, keeping answers under three sho
       this.state.paramResults.betaHeader = result;
     })();
 
-    await Promise.all([stopJob, toolJob, fmtJob, thinkingDisplayJob, tempRestrictionJob, betaHeaderJob]);
+    // web_search 服务端工具探测（#5）：官方支持、Bedrock/Vertex/Kiro/网页逆向多不支持
+    const webSearchJob = (async () => {
+      if (cfg.format !== 'anthropic') {
+        this.state.paramResults.webSearch = { skipped: true, error: { message: 'web_search 服务端工具仅 Anthropic 协议支持', code: 0 } };
+        return;
+      }
+      const wsPrompt = 'Use the web_search tool to find one current fact and cite its source URL. You must call web_search; do not answer from memory.';
+      const result = await ApiClient.sendCustom(
+        { id: 'param_web_search', promptId: 'param_web_search', promptTag: 'params', promptTitle: 'Web Search 服务端工具', promptBody: wsPrompt, testType: 'param_web_search' },
+        ApiClient._buildWebSearchBody(cfg.model, wsPrompt, Object.assign({}, cfg, { stream: false })),
+        Object.assign({}, cfg, { stream: false }),
+        this.state.abortController.signal
+      );
+      this._evaluateWebSearchResult(result);
+      this.state.paramResults.webSearch = result;
+    })();
+
+    await Promise.all([stopJob, toolJob, fmtJob, thinkingDisplayJob, tempRestrictionJob, betaHeaderJob, webSearchJob]);
+  },
+
+  /** 评估 web_search 服务端工具结果（强力官方直连判据） */
+  _evaluateWebSearchResult(r) {
+    if (r.error) {
+      const msg = String(r.error.message || '').toLowerCase();
+      const unsupported = /web_search|tool|not.*(support|allow)|invalid|unknown|unrecognized|unexpected/.test(msg) || r.error.code === 400;
+      r.webSearchStatus = 'fail';
+      r.webSearchSupported = false;
+      r.paramPassed = false;
+      r.paramDetail = unsupported
+        ? '后端拒绝 web_search 工具 → 不支持官方服务端联网搜索（非官方直连的强信号）'
+        : '请求失败: ' + r.error.message;
+      return;
+    }
+    const raw = r.rawResponse || {};
+    const blocks = Array.isArray(raw.content) ? raw.content : (r.contentBlocks || []);
+    const hasServerToolUse = blocks.some(b => b?.type === 'server_tool_use' && /web_search/.test(b?.name || ''));
+    const hasResult = blocks.some(b => /web_search_(tool_result|result)/.test(b?.type || ''));
+    const usageWS = Number(raw.usage?.server_tool_use?.web_search_requests || 0);
+    const hasCitations = blocks.some(b => Array.isArray(b?.citations) && b.citations.length);
+    if (hasResult || usageWS > 0 || (hasServerToolUse && hasCitations)) {
+      r.webSearchStatus = 'pass'; r.webSearchSupported = true; r.paramPassed = true;
+      r.paramDetail = `真实触发服务端联网搜索（${usageWS || '≥1'} 次检索${hasCitations ? ' + 引用来源' : ''}）→ 符合官方直连`;
+    } else if (hasServerToolUse) {
+      r.webSearchStatus = 'partial'; r.webSearchSupported = true; r.paramPassed = false;
+      r.paramDetail = '接受 web_search 并发起 server_tool_use，但未见结果块（可能被中转截断）';
+    } else {
+      r.webSearchStatus = 'partial'; r.webSearchSupported = null; r.paramPassed = false;
+      r.paramDetail = '接受了 web_search 工具但未实际检索（中转可能吞掉工具，或模型未触发）';
+    }
   },
 
   _evaluateImageResult(r) {
@@ -1931,6 +2347,7 @@ Please respond concisely to the user's question, keeping answers under three sho
     this.state.paramResults = {};
     this.state.adversarialResults = [];
     this.state.adversarialSummary = null;
+    this.state.capacityResults = null;
     this.state.lastReport = null;
     this.state.runProgress = null;
     this._updateRunProgress();
@@ -1939,8 +2356,12 @@ Please respond concisely to the user's question, keeping answers under three sho
   },
 
   _setRunning(running) {
-    document.getElementById('btn-start').disabled = running;
+    const startBtn = document.getElementById('btn-start');
+    startBtn.disabled = running;
     document.getElementById('btn-stop').disabled = !running;
+    // #4 运行动效：开始按钮跑条纹动画
+    startBtn.classList.toggle('is-running', running);
+    startBtn.textContent = running ? '⏳ 测试进行中…' : '▶ 开始测试';
   },
 
   /** ========== 实时指标 ========== */
@@ -1989,7 +2410,8 @@ Please respond concisely to the user's question, keeping answers under three sho
       ['m-preset', '—'], ['m-preset-sub', '未启用'],
       ['m-multimodal', '—'], ['m-multimodal-sub', '未启用'],
       ['m-param', '—'], ['m-param-sub', '未启用'],
-      ['m-adversarial', '—'], ['m-adversarial-sub', '未启用']
+      ['m-adversarial', '—'], ['m-adversarial-sub', '未启用'],
+      ['m-capacity', '—'], ['m-capacity-sub', '未启用']
     ];
     for (const [id, txt] of simpleResets) {
       const el = document.getElementById(id);
@@ -2000,7 +2422,7 @@ Please respond concisely to the user's question, keeping answers under three sho
   _resetAnalysisPanels() {
     ['claim-vs-actual', 'identity-keywords', 'consistency-analysis', 'verdict-details', 'channel-analysis',
       'fingerprint-scores', 'response-list', 'preset-analysis', 'image-analysis', 'pdf-analysis', 'param-analysis',
-      'adversarial-analysis', 'signature-replay-analysis', 'cache-verdict', 'cache-rows']
+      'adversarial-analysis', 'capacity-analysis', 'signature-replay-analysis', 'cache-verdict', 'cache-rows']
       .forEach(id => {
         const el = document.getElementById(id);
         if (el) el.innerHTML = '<div class="empty-state">运行测试后显示</div>';
@@ -2054,6 +2476,7 @@ Please respond concisely to the user's question, keeping answers under three sho
     this._renderMultimodalAnalysis(cfg);
     this._renderParamAnalysis(cfg);
     this._renderAdversarialAnalysis(cfg);
+    this._renderCapacityAnalysis(cfg);
     // 综合评分（基于上述所有数据汇总）
     this._renderScorecard(cfg, report);
   },
@@ -2074,6 +2497,7 @@ Please respond concisely to the user's question, keeping answers under three sho
       paramResults: this.state.paramResults || {},
       adversarialResults: this.state.adversarialResults || [],
       adversarialSummary: this.state.adversarialSummary,
+      capacityResults: this.state.capacityResults,
       report, cfg
     });
     this.state.scorecard = sc;
@@ -2409,6 +2833,30 @@ Please respond concisely to the user's question, keeping answers under three sho
   },
 
   /** ========== 思考链分析 ========== */
+  /** #4 思考链测试运行时的实时视图（请求 + 流式思考/回答） */
+  _renderThinkingLive() {
+    const card = document.getElementById('thinking-card');
+    if (card) card.style.display = '';
+    const tabBtn = document.getElementById('thinking-tab-btn');
+    if (tabBtn) tabBtn.style.display = '';
+    const el = document.getElementById('thinking-content');
+    if (!el) return;
+    el.innerHTML = `
+      <div class="suite-running-banner"><span class="live-stream-dot"></span>正在请求思考链…（流式将实时显示思考与回答）</div>
+      <div class="detail-section">
+        <div class="detail-section-title"><span>发送的请求</span></div>
+        <pre class="detail-body" style="white-space:pre-wrap">${this._esc(this._thinkingPrompt || '')}</pre>
+      </div>
+      <div class="detail-section">
+        <div class="detail-section-title"><span>🧠 实时思考过程</span></div>
+        <pre class="detail-body" id="thinking-live-think" style="white-space:pre-wrap;max-height:240px;overflow:auto;color:var(--text-dim)"></pre>
+      </div>
+      <div class="detail-section">
+        <div class="detail-section-title"><span>💬 实时回答</span></div>
+        <pre class="detail-body" id="thinking-live-answer" style="white-space:pre-wrap;max-height:160px;overflow:auto"></pre>
+      </div>`;
+  },
+
   _renderThinkingAnalysis(cfg) {
     const card = document.getElementById('thinking-card');
     if (!cfg.thinkingEnabled) {
@@ -2650,6 +3098,7 @@ Please respond concisely to the user's question, keeping answers under three sho
     const items = [
       ['stopSequences', 'stop_sequences / stop'],
       ['toolUse', 'Tool Use / tool_calls'],
+      ['webSearch', 'Web Search 服务端工具'],
       ['outputFormat', 'output_config.format / response_format'],
       ['thinkingDisplay', 'thinking.display'],
       ['tempRestriction', 'Temperature 限制（Opus 4.7+）'],
@@ -3058,6 +3507,82 @@ Please respond concisely to the user's question, keeping answers under three sho
     sub.innerHTML = `${pct}% 命中 · 均分 ${top.avgScore}${report.channels.length > 1 ? ` · 共 ${report.channels.length} 种` : ''}`;
   },
 
+  /** 渠道命中依据的 hover 富提示 */
+  _channelHitTipData(h, rid) {
+    const whereLabel = { url: '请求 URL', reqBody: '请求体', respBody: '响应体', respHeader: '响应头' }[h.where] || '未知位置';
+    const w = `${h.weight >= 0 ? '+' : ''}${h.weight}`;
+    const rows = [`<div class="tip-title tip-info">判断依据 (${w} 分)</div>`];
+    rows.push(`<div class="tip-row"><span class="tip-k">规则</span><span class="tip-v">${this._esc(h.label)}</span></div>`);
+    rows.push(`<div class="tip-row"><span class="tip-k">位置</span><span class="tip-v">${whereLabel}</span></div>`);
+    if (h.path || h.key) rows.push(`<div class="tip-row"><span class="tip-k">字段</span><span class="tip-v mono">${this._esc(h.path || h.key)}</span></div>`);
+    if (h.value != null) rows.push(`<div class="tip-row"><span class="tip-k">取值</span><span class="tip-v mono">${this._esc(String(h.value).slice(0, 160))}</span></div>`);
+    if (rid && h.where) rows.push(`<div class="tip-foot">点击跳转到该请求并高亮此字段</div>`);
+    return encodeURIComponent(rows.join(''));
+  },
+
+  /** 渲染一条渠道命中依据（可点击跳转到具体请求字段） */
+  _renderChannelHit(h, rid) {
+    const w = `${h.weight >= 0 ? '+' : ''}${h.weight}`;
+    const whereLabel = { url: 'URL', reqBody: '请求体', respBody: '响应体', respHeader: '响应头' }[h.where] || '';
+    const fieldKey = h.path || h.key || '';
+    const pane = (h.where === 'reqBody' || h.where === 'url') ? 'request' : 'response';
+    const canJump = rid && h.where;
+    return `<div class="channel-hit-item ${canJump ? 'channel-hit-jump' : ''}"
+        ${rid ? `data-rid="${this._esc(rid)}"` : ''} data-where="${this._esc(h.where || '')}" data-pane="${pane}"
+        data-path="${this._esc(h.path || '')}" data-key="${this._esc(h.key || '')}" data-value="${this._esc(h.value || '')}"
+        data-tip="${this._channelHitTipData(h, rid)}">
+      <span class="w">${w}</span>
+      <span class="hit-label">${this._esc(h.label)}</span>
+      ${fieldKey ? `<span class="hit-field mono">${whereLabel ? whereLabel + '·' : ''}${this._esc(fieldKey)}${h.value != null ? ` = <b>${this._esc(String(h.value).slice(0, 48))}</b>` : ''}</span>` : ''}
+      ${canJump ? '<span class="hit-go">↪ 查看依据</span>' : ''}
+    </div>`;
+  },
+
+  /** #7 逆向类型专项判定：综合渠道指纹 + AWS 头 + 官方字段缺失 + web_search + 容量，判 Kiro逆向 / 网页逆向 / 官方 */
+  _analyzeReverseType() {
+    const results = this.state.results.filter(r => !r.error && r.response);
+    if (!results.length) return null;
+    const reasons = [];
+    const scores = { official: 0, kiro: 0, web_reverse: 0, aggregator: 0 };
+
+    const chanTop = {};
+    for (const r of results) { const id = r._channel?.top?.id; if (id) chanTop[id] = (chanTop[id] || 0) + 1; }
+    const anyHeader = (re) => results.some(r => Object.keys(r.response?.headers || {}).some(k => re.test(k)));
+    const hasAwsHeaders = anyHeader(/^x-amzn-/i);
+    const hasRateLimit = anyHeader(/^anthropic-ratelimit-/i);
+    const hasCacheFields = results.some(r => { const u = r.rawResponse?.usage; return u && ('cache_read_input_tokens' in u || 'cache_creation_input_tokens' in u); });
+    const hasServiceTier = results.some(r => { const u = r.rawResponse?.usage; return u && 'service_tier' in u; });
+    const looksClaude = results.some(r => /claude/i.test(r.rawResponse?.model || r.returnedModel || r.content || ''));
+    const kiroNaming = results.some(r => /CLAUDE_(SONNET|OPUS|HAIKU)/.test(r.rawResponse?.model || ''));
+    const officialId = results.some(r => /^msg_01/.test(r.rawResponse?.id || ''));
+    const ws = this.state.paramResults?.webSearch;
+    const wsSupported = ws && ws.webSearchSupported === true;
+    const wsUnsupported = ws && ws.webSearchStatus === 'fail';
+    const capHint = this.state.capacityResults?.channelHint;
+
+    if (chanTop.anthropic_official) scores.official += chanTop.anthropic_official * 2;
+    if (chanTop.kiro_reverse) scores.kiro += chanTop.kiro_reverse * 2;
+    if (chanTop.claude_ai_reverse) scores.web_reverse += chanTop.claude_ai_reverse * 2;
+    if (chanTop.aggregator_proxy) scores.aggregator += chanTop.aggregator_proxy;
+
+    if (officialId) { scores.official += 4; reasons.push('响应 id 为官方 msg_01 base58 格式'); }
+    if (hasRateLimit) { scores.official += 2; reasons.push('返回 anthropic-ratelimit-* 限流头（官方独有）'); }
+    if (kiroNaming) { scores.kiro += 6; reasons.push('model 为 Kiro 内部大写命名（CLAUDE_SONNET_…）'); }
+    if (hasAwsHeaders && !officialId) { scores.kiro += 3; reasons.push('响应含 AWS 网关头 x-amzn-*，且非官方 id → 后端经 AWS（Kiro/CodeWhisperer）'); }
+    if (looksClaude && !hasCacheFields && !hasRateLimit && !hasServiceTier) { scores.web_reverse += 3; reasons.push('像 Claude 却缺官方计费字段(usage.cache_*/service_tier)与 ratelimit 头 → 疑似网页逆向/非官方转发'); }
+    if (wsSupported) { scores.official += 5; reasons.push('真实触发 web_search 服务端工具 → 强烈指向官方直连'); }
+    if (wsUnsupported && looksClaude) { scores.web_reverse += 1; scores.kiro += 1; reasons.push('不支持官方 web_search 服务端工具 → 非官方直连'); }
+    if (capHint && /(Kiro|受限|≤32K|低位封顶)/.test(capHint)) { scores.kiro += 2; reasons.push('容量能力推断：' + capHint); }
+
+    const entries = Object.entries(scores).sort((a, b) => b[1] - a[1]);
+    const [topType, topScore] = entries[0];
+    if (topScore <= 0 || !reasons.length) return null;
+    const second = entries[1][1];
+    const labels = { official: '官方直连', kiro: 'Kiro 逆向（CodeWhisperer 后端）', web_reverse: '网页逆向（Claude.ai / Max 镜像）', aggregator: '聚合代理 / 通用中转' };
+    const conf = Math.min(0.95, 0.4 + topScore * 0.06 + (topScore - second) * 0.05);
+    return { type: topType, label: labels[topType], score: topScore, confidence: conf, reasons };
+  },
+
   /** 综合分析面板：渠道得分排名 + 命中明细 */
   _renderChannelAnalysis(report) {
     const el = document.getElementById('channel-analysis');
@@ -3084,6 +3609,8 @@ Please respond concisely to the user's question, keeping answers under three sho
 
     const scores = topResult._channel.scores;
     const maxScore = scores[0]?.score || 1;
+    const rid = topResult.id;
+    const srcLabel = `${topResult.promptTitle || '探测'}${topResult.round != null ? ` · 轮${topResult.round}` : ''}${topResult.model ? ` · ${topResult.model}` : ''}`;
 
     const aggLine = report.channels.length > 1 ? `
       <div style="font-size:12px;color:var(--text-dim);margin-bottom:10px;padding:8px 10px;background:var(--bg-input);border-radius:6px">
@@ -3092,16 +3619,41 @@ Please respond concisely to the user's question, keeping answers under three sho
         ${report.channels.length > 1 ? ' <span class="dim">（同 API 出现多种渠道可能是负载均衡或多源代理）</span>' : ''}
       </div>` : '';
 
-    el.innerHTML = aggLine + scores.map((s, i) => {
+    const srcNote = `
+      <div class="channel-src-note">
+        下列判断依据取自代表样本：<b>${this._esc(srcLabel)}</b>
+        <span class="dim">· 点击任一依据可跳转到该请求并高亮触发字段</span>
+      </div>`;
+
+    // 容量能力测试推断出的渠道线索（如上下文上限偏低 → 疑似 Kiro/受限中转）
+    const capHint = this.state.capacityResults?.channelHint;
+    const capNote = capHint
+      ? `<div class="channel-cap-note">🛰 容量能力推断：${this._esc(capHint)}<span class="dim"> （见「容量能力」标签页）</span></div>`
+      : '';
+
+    // #7 逆向类型专项判定
+    const rev = this._analyzeReverseType();
+    const revBox = rev ? `
+      <div class="reverse-verdict reverse-${rev.type}">
+        <div class="reverse-verdict-head">
+          <span class="reverse-verdict-label">逆向/来源类型判定：${this._esc(rev.label)}</span>
+          <span class="reverse-verdict-conf">置信度 ${(rev.confidence * 100).toFixed(0)}%</span>
+        </div>
+        <ul class="reverse-verdict-reasons">
+          ${rev.reasons.map(x => `<li>${this._esc(x)}</li>`).join('')}
+        </ul>
+      </div>` : '';
+
+    el.innerHTML = revBox + aggLine + capNote + srcNote + scores.map((s, i) => {
       const pct = (s.score / Math.max(maxScore, 50)) * 100;
       const hits = s.hits.length
         ? `<div class="channel-hits">
-            <div style="font-size:11px;color:var(--text-dim);margin-bottom:4px">命中规则:</div>
-            ${s.hits.map(h => `<div class="channel-hit-item"><span class="w">+${h.weight}</span>${this._esc(h.label)}</div>`).join('')}
+            <div style="font-size:11px;color:var(--text-dim);margin-bottom:4px">判断依据 (${s.hits.length})：</div>
+            ${s.hits.map(h => this._renderChannelHit(h, rid)).join('')}
           </div>`
-        : '<div class="channel-hits"><div class="empty-state" style="padding:8px">无命中</div></div>';
+        : '<div class="channel-hits"><div class="empty-state" style="padding:8px">无命中依据</div></div>';
       return `
-        <div class="channel-row ${i === 0 ? 'top' : ''}" data-idx="${i}">
+        <div class="channel-row ${i === 0 ? 'top expanded' : ''}" data-idx="${i}">
           <div class="channel-name">
             <span class="dot" style="background:${s.color}"></span>
             <div>
@@ -3116,9 +3668,10 @@ Please respond concisely to the user's question, keeping answers under three sho
       `;
     }).join('');
 
-    // 点击展开命中明细
+    // 点击行展开命中明细（点击单条依据则跳转，不触发折叠 — 跳转由全局委托处理）
     el.querySelectorAll('.channel-row').forEach(row => {
-      row.addEventListener('click', () => {
+      row.addEventListener('click', (e) => {
+        if (e.target.closest('.channel-hit-jump')) return;
         row.classList.toggle('expanded');
       });
     });
@@ -3263,10 +3816,11 @@ Please respond concisely to the user's question, keeping answers under three sho
     if (!r) return [];
     const anomalies = [];
     const seen = new Set();
-    const add = (level, code, label, detail) => {
+    // field: 触发异常的字段/位置；evidence: 该字段的实际取值（用于 hover 展示「哪个字段导致的」）
+    const add = (level, code, label, detail, field, evidence) => {
       if (seen.has(code)) return;
       seen.add(code);
-      anomalies.push({ level, code, label, detail: detail || label });
+      anomalies.push({ level, code, label, detail: detail || label, field: field || '', evidence: evidence == null ? '' : String(evidence) });
     };
 
     const headers = r.response?.headers || {};
@@ -3286,11 +3840,11 @@ Please respond concisely to the user's question, keeping answers under three sho
 
     if (r.error && !r.response) {
       if (r.error.code === -1) {
-        add('fail', 'client_timeout', '请求超时', '浏览器/本地后端在超时时间内没有拿到上游响应。');
+        add('fail', 'client_timeout', '请求超时', '浏览器/本地后端在超时时间内没有拿到上游响应。', 'error.code', `${r.error.code} (timeout)`);
       } else if (r.error.code === -2) {
-        add('fail', 'client_network_error', '连接失败', 'fetch 连接失败，常见于 DNS、URL、证书、代理或 CORS/预检问题。');
+        add('fail', 'client_network_error', '连接失败', 'fetch 连接失败，常见于 DNS、URL、证书、代理或 CORS/预检问题。', 'error.message', errMsg || 'network error');
       } else {
-        add('fail', 'client_error', '客户端错误', errMsg || '客户端侧请求失败。');
+        add('fail', 'client_error', '客户端错误', errMsg || '客户端侧请求失败。', 'error', `code=${r.error.code}`);
       }
     }
 
@@ -3300,36 +3854,36 @@ Please respond concisely to the user's question, keeping answers under three sho
     if (r.response && (r.response.ok === false || status >= 400)) {
       if (upstreamHtmlError || htmlBody) {
         const msg = parsedBody?.error?.message || errMsg || `HTTP ${status}`;
-        add('fail', 'upstream_html_error', `HTTP ${status || '?'} HTML错误页`, msg);
+        add('fail', 'upstream_html_error', `HTTP ${status || '?'} HTML错误页`, msg, 'response.body', '上游返回了 HTML 错误页而非 JSON');
       } else {
         const msg = parsedBody?.error?.message || parsedBody?.message || errMsg || body.slice(0, 240);
-        add('fail', 'http_error', `HTTP ${status || '?'}错误`, msg || '上游返回非 2xx 状态。');
+        add('fail', 'http_error', `HTTP ${status || '?'}错误`, msg || '上游返回非 2xx 状态。', 'response.status', `HTTP ${status || '?'}${msg ? ' · ' + String(msg).slice(0, 120) : ''}`);
       }
       const requestBody = String(r.request?.body || '');
       if (status === 502 && /"system"\s*:\s*\[/.test(requestBody)) {
-        add('warn', 'system_block_array_502', 'system数组疑似不兼容', '该中转站可能不支持 Anthropic system content block 数组，可改用普通 system 字符串或 user content block 缓存前缀。');
+        add('warn', 'system_block_array_502', 'system数组疑似不兼容', '该中转站可能不支持 Anthropic system content block 数组，可改用普通 system 字符串或 user content block 缓存前缀。', 'request.body.system', 'system 为 content block 数组');
       }
     }
 
     if (r.response?.ok && !r.error) {
       const messageId = this._responseMessageId(r, parsedBody);
       if (!messageId && (r.rawResponse || parsedBody)) {
-        add('warn', 'msg_id_missing', 'msgID缺失', '成功响应中没有可检查的 body.id，渠道可能隐藏或改写了 message id。');
+        add('warn', 'msg_id_missing', 'msgID缺失', '成功响应中没有可检查的 body.id，渠道可能隐藏或改写了 message id。', 'response.body.id', '(无 id)');
       } else if (messageId) {
         const idInfo = this._classifyMessageId(messageId);
         if (!idInfo.known) {
-          add('warn', 'msg_id_abnormal', 'msgID异常', `响应 id=${messageId} 不符合已知 Anthropic / Vertex / Bedrock / OpenAI兼容 / OpenRouter 前缀。`);
+          add('warn', 'msg_id_abnormal', 'msgID异常', `响应 id=${messageId} 不符合已知 Anthropic / Vertex / Bedrock / OpenAI兼容 / OpenRouter 前缀。`, 'response.body.id', messageId);
         }
       }
     }
 
     const contentType = header('content-type');
     if (r.response?.ok && (/text\/html/i.test(contentType) || htmlBody)) {
-      add('fail', 'html_success_body', '成功响应是HTML', 'HTTP 状态为成功，但响应体/Content-Type 看起来是 HTML 页面，不是模型 JSON/SSE。');
+      add('fail', 'html_success_body', '成功响应是HTML', 'HTTP 状态为成功，但响应体/Content-Type 看起来是 HTML 页面，不是模型 JSON/SSE。', 'response.headers.content-type', contentType || 'text/html');
     }
 
     if (this._looksGarbledText(body) || this._looksGarbledText(content)) {
-      add('fail', 'garbled_text', '疑似乱码', '响应文本包含大量替换字符或控制字符，常见于压缩体未正确解码或二进制内容被当文本展示。');
+      add('fail', 'garbled_text', '疑似乱码', '响应文本包含大量替换字符或控制字符，常见于压缩体未正确解码或二进制内容被当文本展示。', 'response.body', '含替换字符/控制字符');
     }
 
     const hasToolUse = (Array.isArray(r.toolUseBlocks) && r.toolUseBlocks.length > 0)
@@ -3340,43 +3894,43 @@ Please respond concisely to the user's question, keeping answers under three sho
       return ['tool_use', 'thinking', 'redacted_thinking'].includes(b.type);
     });
     if (r.response?.ok && !r.error && !content.trim() && !hasToolUse && !hasVisibleBlock) {
-      add('warn', 'empty_output', '空输出', '请求成功但没有解析到文本、工具调用或 thinking/content block。');
+      add('warn', 'empty_output', '空输出', '请求成功但没有解析到文本、工具调用或 thinking/content block。', 'response.body.content', '(空)');
     }
 
     if (r.response?.ok && !r.error) {
       const inputTokens = Number(r.inputTokens || 0);
       const outputTokens = Number(r.outputTokens || 0);
       if (content.trim() && outputTokens === 0 && !hasToolUse) {
-        add('warn', 'output_tokens_zero', '输出token为0', '模型有可见输出，但 usage 中 output/completion tokens 为 0，可能是中转站漏传 usage。');
+        add('warn', 'output_tokens_zero', '输出token为0', '模型有可见输出，但 usage 中 output/completion tokens 为 0，可能是中转站漏传 usage。', 'usage.output_tokens', `0（可见输出 ${content.trim().length} 字）`);
       } else if (!inputTokens && !outputTokens) {
-        add('info', 'usage_missing', 'usage缺失', '响应里没有可用的输入/输出 token 统计，相关 token 检测会降级。');
+        add('info', 'usage_missing', 'usage缺失', '响应里没有可用的输入/输出 token 统计，相关 token 检测会降级。', 'usage', '无 input/output tokens');
       }
     }
 
     const finish = String(r.finishReason || '');
     if (/max_tokens|length/i.test(finish)) {
-      add('warn', 'finish_max_tokens', '被max_tokens截断', `finish_reason/stop_reason=${finish}`);
+      add('warn', 'finish_max_tokens', '被max_tokens截断', `finish_reason/stop_reason=${finish}`, 'stop_reason', finish);
     }
     if (Number(r.latency || 0) > 60000) {
-      add('warn', 'slow_response', '响应超过60s', `耗时 ${r.latency}ms，可能是上游排队、thinking 预算过高或代理链路慢。`);
+      add('warn', 'slow_response', '响应超过60s', `耗时 ${r.latency}ms，可能是上游排队、thinking 预算过高或代理链路慢。`, 'latency', `${r.latency}ms`);
     }
     if (Array.isArray(r.retriedSkipped) && r.retriedSkipped.length) {
-      add('info', 'retried_without_params', '自动剔除参数', `首轮请求被拒后，已剔除 ${r.retriedSkipped.join(', ')} 重试。`);
+      add('info', 'retried_without_params', '自动剔除参数', `首轮请求被拒后，已剔除 ${r.retriedSkipped.join(', ')} 重试。`, 'request.body', r.retriedSkipped.join(', '));
     }
     const decoded = header('x-mft-decoded');
     if (decoded) {
-      add('info', 'proxy_decoded_body', '后端已解压', `本地后端已对上游响应执行 ${decoded} 解压。`);
+      add('info', 'proxy_decoded_body', '后端已解压', `本地后端已对上游响应执行 ${decoded} 解压。`, 'response.headers.x-mft-decoded', decoded);
     }
     const proxyRetryCount = Number(header('x-mft-retry-count') || 0);
     if (proxyRetryCount > 0) {
-      add('info', 'proxy_retried', '后端已重试', `本地后端遇到上游临时错误后自动重试 ${proxyRetryCount} 次。`);
+      add('info', 'proxy_retried', '后端已重试', `本地后端遇到上游临时错误后自动重试 ${proxyRetryCount} 次。`, 'response.headers.x-mft-retry-count', String(proxyRetryCount));
     }
     const proxyQueueWait = Number(header('x-mft-queue-wait-ms') || 0);
     if (proxyQueueWait > 0) {
-      add('info', 'proxy_queued', '后端已排队', `本地后端按上游域名限流，排队等待 ${proxyQueueWait}ms 后转发。`);
+      add('info', 'proxy_queued', '后端已排队', `本地后端按上游域名限流，排队等待 ${proxyQueueWait}ms 后转发。`, 'response.headers.x-mft-queue-wait-ms', `${proxyQueueWait}ms`);
     }
     if (!r.error && r.model && r.returnedModel && !this._modelsLookEquivalentForRelay(r.model, r.returnedModel)) {
-      add('warn', 'returned_model_mismatch', '返回模型不同', `请求 model=${r.model}；响应 model=${r.returnedModel}。单纯完整日期后缀不会触发此提示。`);
+      add('warn', 'returned_model_mismatch', '返回模型不同', `请求 model=${r.model}；响应 model=${r.returnedModel}。单纯完整日期后缀不会触发此提示。`, 'request.model → response.model', `${r.model} → ${r.returnedModel}`);
     }
 
     return anomalies;
@@ -3464,11 +4018,28 @@ Please respond concisely to the user's question, keeping answers under three sho
     return `${prefix}-info`;
   },
 
+  /**
+   * 构造异常 hover 富提示（URI 编码的 HTML），供全局 [data-tip] 浮层使用。
+   * 展示：级别 + 原因 + 触发字段 + 字段实际取值 + 来自哪一次请求。
+   */
+  _anomalyTipData(a, r) {
+    const levelLabel = { fail: '异常', warn: '警告', info: '提示' }[a.level] || '提示';
+    const rows = [`<div class="tip-title tip-${a.level}">${levelLabel} · ${this._esc(a.label)}</div>`];
+    rows.push(`<div class="tip-row"><span class="tip-k">原因</span><span class="tip-v">${this._esc(a.detail)}</span></div>`);
+    if (a.field) rows.push(`<div class="tip-row"><span class="tip-k">字段</span><span class="tip-v mono">${this._esc(a.field)}</span></div>`);
+    if (a.evidence) rows.push(`<div class="tip-row"><span class="tip-k">取值</span><span class="tip-v mono">${this._esc(String(a.evidence).slice(0, 160))}</span></div>`);
+    if (r) {
+      const src = `${r.promptTitle || '探测'}${r.round != null ? ` · 轮${r.round}` : ''}${r.model ? ` · ${r.model}` : ''}`;
+      rows.push(`<div class="tip-row"><span class="tip-k">来源</span><span class="tip-v">${this._esc(src)}</span></div>`);
+    }
+    return encodeURIComponent(rows.join(''));
+  },
+
   _renderAnomalyBadges(r) {
     const anomalies = this._detectResponseAnomalies(r);
     if (!anomalies.length) return '';
     const shown = anomalies.slice(0, 3).map(a => `
-      <span class="badge badge-anomaly ${this._anomalyClass(a.level, 'badge-anomaly')}" title="${this._esc(a.detail)}">
+      <span class="badge badge-anomaly ${this._anomalyClass(a.level, 'badge-anomaly')}" data-tip="${this._anomalyTipData(a, r)}">
         ${this._esc(a.label)}
       </span>
     `).join('');
@@ -3483,7 +4054,7 @@ Please respond concisely to the user's question, keeping answers under three sho
     if (!anomalies.length) return '';
     const prefix = { fail: '异常', warn: '警告', info: '提示' };
     const shown = anomalies.slice(0, 3).map(a => `
-      <span class="conv-eval-pill ${a.level === 'fail' ? 'fail' : a.level === 'warn' ? 'warn' : 'info'}" title="${this._esc(a.detail)}">
+      <span class="conv-eval-pill ${a.level === 'fail' ? 'fail' : a.level === 'warn' ? 'warn' : 'info'}" data-tip="${this._anomalyTipData(a, r)}">
         ${prefix[a.level] || '提示'}:${this._esc(a.label)}
       </span>
     `).join('');
@@ -3507,12 +4078,138 @@ Please respond concisely to the user's question, keeping answers under three sho
               <div>
                 <div class="anomaly-label">${this._esc(a.label)}</div>
                 <div class="anomaly-detail">${this._esc(a.detail)}</div>
+                ${a.field ? `<div class="anomaly-evidence"><code>${this._esc(a.field)}</code>${a.evidence ? ` = <span class="ev">${this._esc(String(a.evidence).slice(0, 200))}</span>` : ''}</div>` : ''}
               </div>
             </div>
           `).join('')}
         </div>
       </div>
     `;
+  },
+
+  /** ========== 全局富 hover 浮层（[data-tip] = URI 编码 HTML） ========== */
+  _initTooltip() {
+    if (this._tooltipBound) return;
+    this._tooltipBound = true;
+    let tip = document.getElementById('mft-tooltip');
+    if (!tip) {
+      tip = document.createElement('div');
+      tip.id = 'mft-tooltip';
+      tip.className = 'mft-tooltip';
+      document.body.appendChild(tip);
+    }
+    const place = (e) => {
+      const pad = 14;
+      const vw = window.innerWidth, vh = window.innerHeight;
+      const rect = tip.getBoundingClientRect();
+      let x = e.clientX + pad;
+      let y = e.clientY + pad;
+      if (x + rect.width + 8 > vw) x = e.clientX - rect.width - pad;
+      if (y + rect.height + 8 > vh) y = e.clientY - rect.height - pad;
+      tip.style.left = Math.max(6, x) + 'px';
+      tip.style.top = Math.max(6, y) + 'px';
+    };
+    document.addEventListener('mouseover', (e) => {
+      const el = e.target.closest('[data-tip]');
+      if (!el) return;
+      const data = el.getAttribute('data-tip');
+      if (!data) return;
+      tip.innerHTML = decodeURIComponent(data);
+      tip.classList.add('show');
+      place(e);
+    });
+    document.addEventListener('mousemove', (e) => {
+      if (tip.classList.contains('show')) place(e);
+    });
+    document.addEventListener('mouseout', (e) => {
+      const el = e.target.closest('[data-tip]');
+      if (el && !el.contains(e.relatedTarget)) tip.classList.remove('show');
+    });
+    // 滚动/点击时收起，避免残留
+    document.addEventListener('scroll', () => tip.classList.remove('show'), true);
+
+    // 全局委托：点击任一渠道判断依据 → 跳转到对应请求并高亮触发字段
+    document.addEventListener('click', (e) => {
+      const hit = e.target.closest('.channel-hit-jump');
+      if (!hit || !hit.dataset.rid) return;
+      tip.classList.remove('show');
+      this._jumpToResultField(hit.dataset.rid, {
+        where: hit.dataset.where,
+        pane: hit.dataset.pane,
+        path: hit.dataset.path,
+        key: hit.dataset.key,
+        value: hit.dataset.value
+      });
+    });
+  },
+
+  /**
+   * 「判断依据 → 具体请求字段」跳转：
+   * 切到探测对话 → 展开对应任务/轮次明细 → 激活相关面板 → 高亮触发字段并滚动到视野。
+   */
+  _jumpToResultField(rid, opt = {}) {
+    if (!rid) return;
+    document.querySelector('.tab[data-tab="responses"]')?.click();
+    this._clearEvidenceHighlights();
+    requestAnimationFrame(() => {
+      // 优先在探测对话气泡里找；找不到回退到扁平响应列表
+      let paneRoot = [...document.querySelectorAll('.conv-turn-detail[data-result-id]')]
+        .find(d => d.dataset.resultId === rid);
+      if (paneRoot) {
+        const taskWrap = paneRoot.closest('.probe-task-bubbles');
+        if (taskWrap) {
+          taskWrap.classList.remove('collapsed');
+          const tg = taskWrap.querySelector('.probe-task-toggle');
+          if (tg) tg.textContent = '▼';
+        }
+        if (paneRoot.tagName === 'DETAILS') paneRoot.open = true;
+      } else {
+        const item = [...document.querySelectorAll('.response-item[data-result-id]')]
+          .find(d => d.dataset.resultId === rid);
+        if (!item) return this._toast('未找到对应请求明细', 'warn');
+        item.querySelector('.response-content')?.classList.remove('collapsed');
+        paneRoot = item.querySelector('.response-content');
+      }
+      if (!paneRoot) return;
+
+      const pane = opt.pane || (opt.where === 'reqBody' || opt.where === 'url' ? 'request' : 'response');
+      paneRoot.querySelectorAll('.detail-tab').forEach(t => t.classList.toggle('active', t.dataset.pane === pane));
+      paneRoot.querySelectorAll('.detail-pane').forEach(p => p.classList.toggle('active', p.dataset.pane === pane));
+      const paneEl = paneRoot.querySelector(`.detail-pane[data-pane="${pane}"]`);
+      if (!paneEl) { paneRoot.scrollIntoView({ behavior: 'smooth', block: 'center' }); return; }
+
+      const needle = (opt.value && !/^\(.*缺失.*\)$/.test(opt.value))
+        ? opt.value
+        : (opt.key || (opt.path ? String(opt.path).split('.').pop().replace(/\[\]$/, '') : ''));
+      const mark = this._highlightEvidenceInPane(paneEl, needle);
+      (mark || paneEl).scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+  },
+
+  _clearEvidenceHighlights() {
+    document.querySelectorAll('mark.evidence-hl').forEach(m => {
+      const parent = m.parentNode;
+      m.replaceWith(document.createTextNode(m.textContent));
+      if (parent && parent.normalize) parent.normalize();
+    });
+  },
+
+  /** 在某个详情面板的 <pre> 里高亮第一处命中字段值 */
+  _highlightEvidenceInPane(paneEl, needle) {
+    if (!needle) return null;
+    const want = String(needle).toLowerCase();
+    const pres = paneEl.querySelectorAll('pre.detail-body');
+    for (const pre of pres) {
+      const text = pre.textContent;
+      const idx = text.toLowerCase().indexOf(want);
+      if (idx < 0) continue;
+      const before = text.slice(0, idx);
+      const match = text.slice(idx, idx + needle.length);
+      const after = text.slice(idx + needle.length);
+      pre.innerHTML = this._esc(before) + '<mark class="evidence-hl evidence-flash">' + this._esc(match) + '</mark>' + this._esc(after);
+      return pre.querySelector('mark.evidence-hl');
+    }
+    return null;
   },
 
   /** ========== 响应列表 ========== */
@@ -3979,10 +4676,10 @@ Please respond concisely to the user's question, keeping answers under three sho
         </div>
       </div>
       <div class="detail-section">
-        <div class="detail-section-title"><span>命中规则 (${c.top.hits.length})</span></div>
+        <div class="detail-section-title"><span>判断依据 (${c.top.hits.length})</span></div>
         ${c.top.hits.length
-          ? `<div class="channel-rule-list">${c.top.hits.map(h => `<div class="channel-rule-item"><span class="w">+${h.weight}</span>${this._esc(h.label)}</div>`).join('')}</div>`
-          : '<div class="empty-state" style="padding:10px">无命中</div>'
+          ? `<div class="channel-rule-list">${c.top.hits.map(h => this._renderChannelHit(h, r.id)).join('')}</div>`
+          : '<div class="empty-state" style="padding:10px">无命中依据</div>'
         }
       </div>
       ${c.scores.length > 1 ? `

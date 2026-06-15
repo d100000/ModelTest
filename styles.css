@@ -590,11 +590,33 @@ textarea {
 .channel-hit-item {
   font-size: 11px;
   color: var(--text-dim);
-  padding: 3px 0;
+  padding: 4px 6px;
   font-family: "SF Mono", Monaco, monospace;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  border-radius: 4px;
 }
-.channel-hit-item .w { color: var(--accent); font-weight: 600; margin-right: 8px; }
+.channel-hit-item .w { color: var(--accent); font-weight: 600; flex-shrink: 0; }
 .channel-hit-item .w.neg { color: var(--warning); }
+.channel-hit-item .hit-label { color: var(--text-dim); }
+.channel-hit-item .hit-field { color: var(--text); opacity: .9; }
+.channel-hit-item .hit-field b { color: var(--accent); font-weight: 600; }
+.channel-hit-item .hit-go { margin-left: auto; color: var(--accent); opacity: 0; transition: opacity .12s; flex-shrink: 0; }
+.channel-hit-item.channel-hit-jump { cursor: pointer; }
+.channel-hit-item.channel-hit-jump:hover { background: rgba(91,141,239,0.14); }
+.channel-hit-item.channel-hit-jump:hover .hit-go { opacity: 1; }
+.channel-src-note {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 10px;
+  padding: 7px 10px;
+  background: var(--bg-input);
+  border-radius: 6px;
+  border-left: 3px solid var(--accent);
+}
+.channel-src-note b { color: var(--text); }
 
 /* ===== Tabs ===== */
 .tabs {
@@ -1693,3 +1715,186 @@ canvas {
   .progress-area { flex-basis: 100%; margin-left: 0; min-width: 0; }
   .progress-metrics { grid-template-columns: repeat(3, minmax(80px, 1fr)); }
 }
+
+/* ===== 全局富 hover 浮层 ===== */
+.mft-tooltip {
+  position: fixed;
+  z-index: 9999;
+  max-width: 380px;
+  padding: 9px 11px;
+  background: #11151c;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 28px rgba(0,0,0,0.5);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity .1s;
+}
+.mft-tooltip.show { opacity: 1; }
+.mft-tooltip .tip-title { font-weight: 700; margin-bottom: 5px; }
+.mft-tooltip .tip-title.tip-fail { color: var(--danger, #f87171); }
+.mft-tooltip .tip-title.tip-warn { color: var(--warning, #fbbf24); }
+.mft-tooltip .tip-title.tip-info { color: var(--accent, #5b8def); }
+.mft-tooltip .tip-row { display: flex; gap: 8px; margin-top: 2px; }
+.mft-tooltip .tip-k { flex-shrink: 0; width: 34px; color: var(--text-dim); }
+.mft-tooltip .tip-v { color: var(--text); word-break: break-word; }
+.mft-tooltip .tip-v.mono { font-family: "SF Mono", Monaco, monospace; font-size: 11px; }
+.mft-tooltip .tip-foot { margin-top: 6px; padding-top: 5px; border-top: 1px dashed var(--border); color: var(--accent); font-size: 11px; }
+
+/* 异常标注里悬停可点的徽章/胶囊提示可点击感 */
+.badge-anomaly[data-tip], .conv-eval-pill[data-tip] { cursor: help; }
+
+/* 异常展开详情里的「字段 = 取值」 */
+.anomaly-evidence {
+  margin-top: 4px;
+  font-size: 11px;
+  font-family: "SF Mono", Monaco, monospace;
+  color: var(--text-dim);
+}
+.anomaly-evidence code {
+  background: rgba(0,0,0,0.25);
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: var(--accent);
+}
+.anomaly-evidence .ev { color: var(--text); }
+
+/* 证据高亮（跳转后闪烁标记触发字段） */
+mark.evidence-hl {
+  background: rgba(251,191,36,0.32);
+  color: inherit;
+  border-radius: 3px;
+  padding: 0 2px;
+  box-shadow: 0 0 0 1px rgba(251,191,36,0.55);
+}
+mark.evidence-flash { animation: evidenceFlash 1.4s ease-out 1; }
+@keyframes evidenceFlash {
+  0%, 30% { background: rgba(251,191,36,0.75); box-shadow: 0 0 0 3px rgba(251,191,36,0.5); }
+  100% { background: rgba(251,191,36,0.32); box-shadow: 0 0 0 1px rgba(251,191,36,0.55); }
+}
+
+/* ===== 容量能力测试面板 ===== */
+.capacity-hint-box {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 14px;
+}
+.capacity-hint-title { font-weight: 700; font-size: 12px; color: var(--text-dim); margin-bottom: 6px; }
+.cap-hint { font-size: 13px; line-height: 1.6; margin-top: 3px; }
+.cap-hint-channel { color: var(--warning, #fbbf24); }
+.cap-hint-model { color: var(--accent, #5b8def); }
+.capacity-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 4px; }
+.capacity-table th, .capacity-table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+.capacity-table th { color: var(--text-dim); font-weight: 600; font-size: 11px; }
+.capacity-table td.mono, .capacity-table .mono { font-family: "SF Mono", Monaco, monospace; }
+.cap-ok { color: #4ade80; font-weight: 600; }
+.cap-no { color: var(--danger, #f87171); font-weight: 600; }
+.cap-warn { color: var(--warning, #fbbf24); font-weight: 600; }
+.cap-tag {
+  font-size: 10px; padding: 1px 5px; border-radius: 4px;
+  background: rgba(91,141,239,0.18); color: var(--accent); margin-left: 4px;
+}
+.capacity-summary { margin-top: 8px; font-size: 12px; color: var(--text-dim); }
+.capacity-summary b { color: var(--text); }
+.capacity-out-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; margin-top: 4px; }
+.cap-kv { background: var(--bg-input); border-radius: 6px; padding: 8px 10px; }
+.cap-kv .k { display: block; font-size: 11px; color: var(--text-dim); margin-bottom: 3px; }
+.cap-kv .v { font-size: 14px; font-weight: 600; }
+.channel-cap-note {
+  font-size: 12px; line-height: 1.6; color: var(--warning, #fbbf24);
+  background: rgba(251,191,36,0.1); border: 1px solid rgba(251,191,36,0.3);
+  border-radius: 6px; padding: 8px 10px; margin-bottom: 10px;
+}
+
+/* ===== #1 测试配置弹框 ===== */
+.btn-block { display: block; width: 100%; text-align: center; }
+.btn-config-open {
+  background: linear-gradient(135deg, rgba(91,141,239,0.18), rgba(167,139,250,0.18));
+  border: 1px solid var(--accent); color: var(--text); font-weight: 600; padding: 11px;
+}
+.btn-config-open:hover { background: linear-gradient(135deg, rgba(91,141,239,0.32), rgba(167,139,250,0.32)); }
+.config-trigger-summary { margin-top: 10px; font-size: 11px; line-height: 1.9; color: var(--text-dim); }
+.cfg-chip {
+  display: inline-block; margin: 0 4px 4px 0; padding: 1px 8px; border-radius: 10px;
+  background: rgba(91,141,239,0.16); color: var(--accent); font-size: 11px; font-weight: 600;
+}
+.modal-overlay {
+  position: fixed; inset: 0; z-index: 4000;
+  background: rgba(6,8,12,0.62); backdrop-filter: blur(3px);
+  display: flex; align-items: flex-start; justify-content: center;
+  padding: 40px 16px; overflow-y: auto;
+  opacity: 0; transition: opacity .2s ease;
+}
+.modal-overlay[hidden] { display: none; }
+.modal-overlay.show { opacity: 1; }
+.modal-card {
+  width: 100%; max-width: 560px; background: var(--bg-panel, #131820);
+  border: 1px solid var(--border); border-radius: 14px;
+  box-shadow: 0 24px 70px rgba(0,0,0,0.55);
+  transform: translateY(-12px) scale(.98); transition: transform .2s ease;
+  display: flex; flex-direction: column; max-height: calc(100vh - 80px);
+}
+.modal-overlay.show .modal-card { transform: translateY(0) scale(1); }
+.modal-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 18px; border-bottom: 1px solid var(--border); flex-shrink: 0;
+}
+.modal-head h2 { margin: 0; font-size: 16px; }
+.modal-close {
+  background: none; border: none; color: var(--text-dim); font-size: 18px; cursor: pointer;
+  width: 30px; height: 30px; border-radius: 8px; line-height: 1;
+}
+.modal-close:hover { background: var(--bg-input); color: var(--text); }
+.modal-body { padding: 6px 18px 14px; overflow-y: auto; }
+.modal-body .card.in-modal { background: none; border: none; box-shadow: none; margin: 0; }
+.modal-body .card.in-modal > .card-header { display: none; }
+.modal-body .card.in-modal > .card-body { padding: 8px 0; }
+.modal-foot {
+  padding: 12px 18px; border-top: 1px solid var(--border); text-align: right; flex-shrink: 0;
+}
+
+/* ===== #4 运行动效 ===== */
+@keyframes mftPulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
+@keyframes mftStripes { from { background-position: 0 0; } to { background-position: 32px 0; } }
+.probe-task-status.running, .probe-task-row.running .probe-task-name { animation: mftPulse 1.2s ease-in-out infinite; }
+.live-stream-dot {
+  display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--accent); margin-right: 6px; animation: mftPulse 1s ease-in-out infinite;
+}
+.btn-primary.is-running {
+  background-image: linear-gradient(135deg, rgba(255,255,255,.12) 25%, transparent 25%, transparent 50%, rgba(255,255,255,.12) 50%, rgba(255,255,255,.12) 75%, transparent 75%);
+  background-size: 32px 32px; animation: mftStripes .8s linear infinite;
+}
+.conv-bubble-content.streaming::after {
+  content: '▋'; color: var(--accent); animation: mftPulse .9s steps(2) infinite; margin-left: 1px;
+}
+.suite-running-banner {
+  display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--accent);
+  background: rgba(91,141,239,0.1); border: 1px solid rgba(91,141,239,0.28);
+  border-radius: 8px; padding: 8px 12px; margin-bottom: 10px;
+}
+
+/* ===== #7 逆向类型判定 ===== */
+.reverse-verdict {
+  border-radius: 10px; padding: 11px 14px; margin-bottom: 12px;
+  border: 1px solid var(--border); background: var(--bg-input);
+  border-left-width: 4px;
+}
+.reverse-verdict.reverse-official { border-left-color: #4ade80; }
+.reverse-verdict.reverse-kiro { border-left-color: #fbbf24; }
+.reverse-verdict.reverse-web_reverse { border-left-color: #f87171; }
+.reverse-verdict.reverse-aggregator { border-left-color: #94a3b8; }
+.reverse-verdict-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.reverse-verdict-label { font-weight: 700; font-size: 14px; }
+.reverse-verdict.reverse-official .reverse-verdict-label { color: #4ade80; }
+.reverse-verdict.reverse-kiro .reverse-verdict-label { color: #fbbf24; }
+.reverse-verdict.reverse-web_reverse .reverse-verdict-label { color: #f87171; }
+.reverse-verdict-conf { font-size: 11px; color: var(--text-dim); white-space: nowrap; }
+.reverse-verdict-reasons { margin: 8px 0 0; padding-left: 18px; font-size: 12px; line-height: 1.7; color: var(--text-dim); }
+.reverse-verdict-reasons li { margin: 1px 0; }

@@ -100,7 +100,14 @@ const CHANNEL_FINGERPRINTS = [
       { weight: 80, type: 'url_host', regex: /^q\.[a-z0-9-]+\.amazonaws\.com$/i, label: 'URL host 是 q.<region>.amazonaws.com（Kiro/CodeWhisperer 后端）' },
       { weight: 70, type: 'url_host', regex: /codewhisperer\.[a-z0-9-]+\.amazonaws\.com$/i, label: 'URL host 是 codewhisperer.<region>.amazonaws.com' },
       { weight: 50, type: 'url_host', regex: /kiro\.dev$/i, label: 'URL host 含 kiro.dev' },
-      { weight: 20, type: 'body_field', path: 'id', regex: /^m(?:sg|sq)_bdrk_/i, label: 'body.id 使用 AWS 风格前缀' }
+      { weight: 40, type: 'url_host', regex: /(?:^|[.\-_])kiro(?:2?api)?(?:[.\-_]|$)/i, label: 'URL host 命中 kiro / kiro2api 反代命名' },
+      { weight: 20, type: 'body_field', path: 'id', regex: /^m(?:sg|sq)_bdrk_/i, label: 'body.id 使用 AWS 风格前缀' },
+      // === AWS 后端头泄露（即便 kiro2api 把响应体规整成 Anthropic 格式，AWS 网关头常仍透传）===
+      // 这些头 Bedrock 也会带，但 Bedrock 有 msg_bdrk_ id 强指纹会胜出；规整化的 Kiro 没有该 id，
+      // 于是「claude 模型 + AWS 网关头 + 无 msg_bdrk_/msg_vrtx_ id」就成了 Kiro/CodeWhisperer 的弱-中信号。
+      { weight: 28, type: 'response_header_exists', key: 'x-amzn-requestid', label: '响应含 x-amzn-RequestId（AWS 网关后端）' },
+      { weight: 22, type: 'response_header_exists', key: 'x-amzn-trace-id', label: '响应含 x-amzn-trace-id（AWS 网关后端）' },
+      { weight: 18, type: 'response_header_exists', key: 'x-amzn-sessionid', label: '响应含 x-amzn-SessionId（CodeWhisperer 会话）' }
     ],
     requiresClaude: true
   },
@@ -245,7 +252,16 @@ const ChannelDetector = {
         const matched = this._evalRule(rule, { url, respBody, reqBody, respHeaders });
         if (matched) {
           score += rule.weight;
-          hits.push({ label: rule.label, weight: rule.weight });
+          // matched 是描述命中位置/取值的对象，用于前端「判断依据 → 跳转到具体请求字段」
+          hits.push({
+            label: rule.label,
+            weight: rule.weight,
+            type: rule.type,
+            where: matched.where || null,          // url | reqBody | respBody | respHeader
+            path: matched.path || rule.path || rule.arrayPath || null,
+            key: matched.key || rule.key || null,
+            value: matched.value != null ? String(matched.value).slice(0, 200) : null
+          });
         }
       }
       out.push({
@@ -314,67 +330,84 @@ const ChannelDetector = {
 
   // ===== 规则求值 =====
 
+  /**
+   * 求值单条规则。
+   * 命中返回一个描述对象 { where, path?, key?, value }（恒为真值），未命中返回 false。
+   * where 用于前端定位：url=请求行 / reqBody=请求体 / respBody=响应体 / respHeader=响应头。
+   */
   _evalRule(rule, ctx) {
     const { url, respBody, reqBody, respHeaders } = ctx;
+    const headerValue = (key) => {
+      if (!respHeaders) return null;
+      const target = key.toLowerCase();
+      for (const k of Object.keys(respHeaders)) {
+        if (k.toLowerCase() === target) return respHeaders[k];
+      }
+      return null;
+    };
     switch (rule.type) {
       case 'url_host': {
         try {
           const u = new URL(url);
-          return rule.regex.test(u.host);
+          return rule.regex.test(u.host) ? { where: 'url', path: 'host', value: u.host } : false;
         } catch (e) { return false; }
       }
       case 'url_path': {
         try {
           const u = new URL(url);
-          return rule.regex.test(u.pathname);
+          return rule.regex.test(u.pathname) ? { where: 'url', path: 'path', value: u.pathname } : false;
         } catch (e) { return false; }
       }
       case 'body_field': {
         const v = this._getPath(respBody, rule.path);
         if (v == null) return false;
-        return rule.regex.test(String(v));
+        return rule.regex.test(String(v)) ? { where: 'respBody', path: rule.path, value: v } : false;
       }
       case 'body_field_missing': {
         const v = this._getPath(respBody, rule.path);
-        return v == null;
+        return v == null ? { where: 'respBody', path: rule.path, value: '(字段缺失)' } : false;
       }
       case 'request_body_field': {
         const v = this._getPath(reqBody, rule.path);
         if (v == null) return false;
-        return rule.regex.test(String(v));
+        return rule.regex.test(String(v)) ? { where: 'reqBody', path: rule.path, value: v } : false;
       }
       case 'body_array_field': {
         const arr = this._getPath(respBody, rule.arrayPath);
         if (!Array.isArray(arr)) return false;
-        return arr.some(item => {
+        let hitVal = null;
+        const ok = arr.some(item => {
           const v = this._getPath(item, rule.path);
-          return v != null && rule.regex.test(String(v));
+          if (v != null && rule.regex.test(String(v))) { hitVal = v; return true; }
+          return false;
         });
+        return ok ? { where: 'respBody', path: `${rule.arrayPath}[].${rule.path}`, value: hitVal } : false;
       }
       case 'body_field_exists': {
         const v = this._getPath(respBody, rule.path);
-        return v !== null && v !== undefined;
+        return (v !== null && v !== undefined)
+          ? { where: 'respBody', path: rule.path, value: typeof v === 'object' ? JSON.stringify(v) : v }
+          : false;
       }
       case 'body_field_type': {
         const v = this._getPath(respBody, rule.path);
         if (v === null || v === undefined) return false;
         const t = Array.isArray(v) ? 'array' : typeof v;
-        return t === rule.expected;
+        return t === rule.expected ? { where: 'respBody', path: rule.path, value: `${t}` } : false;
       }
       case 'body_field_in': {
         const v = this._getPath(respBody, rule.path);
         if (v === null || v === undefined) return false;
-        return rule.values.includes(String(v));
+        return rule.values.includes(String(v)) ? { where: 'respBody', path: rule.path, value: v } : false;
       }
       case 'response_header_exists': {
-        if (!respHeaders) return false;
-        const key = rule.key.toLowerCase();
-        return Object.keys(respHeaders).some(k => k.toLowerCase() === key);
+        const v = headerValue(rule.key);
+        return v != null ? { where: 'respHeader', key: rule.key, value: v } : false;
       }
       case 'response_header_missing': {
         if (!respHeaders || !Object.keys(respHeaders).length) return false;
-        const key = rule.key.toLowerCase();
-        return !Object.keys(respHeaders).some(k => k.toLowerCase() === key);
+        const v = headerValue(rule.key);
+        return v == null ? { where: 'respHeader', key: rule.key, value: '(响应头缺失)' } : false;
       }
       default:
         return false;
