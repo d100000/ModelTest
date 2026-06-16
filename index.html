@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>模型保真测试 · Model Fidelity Tester</title>
-<link rel="stylesheet" href="styles.css?v=58" />
+<link rel="stylesheet" href="styles.css?v=59" />
 </head>
 <body>
 <header class="app-header">
@@ -64,14 +64,14 @@
         </label>
         <label class="field">
           <span class="field-label">
-            模型名称（手动 / 兜底）
+            模型名称（可留空，自动测全部）
             <button class="btn-icon" id="btn-load-models" title="从当前 API 读取模型列表" style="font-size:11px;padding:0 6px;">读取列表</button>
           </span>
           <input type="text" id="cfg-model" placeholder="claude-opus-4-5 / gpt-4o / gpt-4-turbo ..." />
           <select id="cfg-model-list" multiple size="5" style="display:none;margin-top:8px"></select>
           <label class="suite-toggle" style="margin-top:6px">
             <input type="checkbox" id="cfg-autoselect-claude" checked />
-            <span class="toggle-label"><strong>读取后自动全选 Claude 模型横向对比</strong><span class="dim" style="font-size:11px;display:block;margin-left:24px">同时测试所有 Claude 档位，对比分析是否掺假 / 偷换模型名</span></span>
+            <span class="toggle-label"><strong>自动全选 Claude 模型横向对比</strong><span class="dim" style="font-size:11px;display:block;margin-left:24px">无需手动选模型：开始测试时自动获取列表并测全部 Claude（取消勾选则测接口返回的全部模型）</span></span>
           </label>
           <div id="model-list-hint" class="url-preview"></div>
         </label>
@@ -852,13 +852,13 @@
   </div>
 </div>
 
-<script src="js/prompts.js?v=58"></script>
-<script src="js/fingerprints.js?v=58"></script>
-<script src="js/channels.js?v=58"></script>
-<script src="js/scorecard.js?v=58"></script>
-<script src="js/analyzer.js?v=58"></script>
-<script src="js/api.js?v=58"></script>
-<script src="js/charts.js?v=58"></script>
-<script src="js/app.js?v=58"></script>
+<script src="js/prompts.js?v=59"></script>
+<script src="js/fingerprints.js?v=59"></script>
+<script src="js/channels.js?v=59"></script>
+<script src="js/scorecard.js?v=59"></script>
+<script src="js/analyzer.js?v=59"></script>
+<script src="js/api.js?v=59"></script>
+<script src="js/charts.js?v=59"></script>
+<script src="js/app.js?v=59"></script>
 </body>
 </html>

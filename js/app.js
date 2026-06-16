@@ -745,6 +745,46 @@ Please respond concisely to the user's question, keeping answers under three sho
   },
 
   /**
+   * 解析本次运行要测试的模型集合 —— 无需手动选模型。
+   * 优先级：用户已选/手填 > 自动从接口拉取的列表（默认全部 Claude；关闭「自动全选 Claude」则测全部模型）。
+   */
+  async _resolveModelsForRun(cfg) {
+    let models = this._getSelectedModels();
+    if (models.length) return models;
+
+    // 未选任何模型：自动通过接口获取模型列表
+    if (cfg.url && cfg.apiKey) {
+      if (!this.state.availableModels.length) {
+        this._toast('未选择模型，正在自动读取模型列表…', 'info');
+        try { await this._loadModels({ auto: true }); } catch (_) {}
+      }
+      // _loadModels 可能已按「自动全选 Claude」勾选；重新读取
+      models = this._getSelectedModels();
+      if (models.length) return models;
+
+      // 仍为空：直接用接口返回的全部模型（按开关决定 Claude-only 还是全部）
+      const all = (this.state.availableModels || []).map(m => m.id).filter(Boolean);
+      if (!all.length) return [];
+      const autoClaudeEl = document.getElementById('cfg-autoselect-claude');
+      const claude = all.filter(id => /claude/i.test(id));
+      const pick = ((!autoClaudeEl || autoClaudeEl.checked) && claude.length) ? claude : all;
+      this._selectModelsInUI(pick);  // 同步选中到 UI，便于横向对比渲染与用户可见
+      this._updateTotalRequests();
+      return pick;
+    }
+    return models;
+  },
+
+  /** 程序化把给定模型 id 选中到多选框（不触发 change，故不会置位 _userTouchedModelSelect） */
+  _selectModelsInUI(ids) {
+    const sel = document.getElementById('cfg-model-list');
+    if (!sel || !sel.options.length) return;
+    const set = new Set(ids);
+    for (const opt of sel.options) opt.selected = set.has(opt.value);
+    if (sel.style.display === 'none') sel.style.display = '';
+  },
+
+  /**
    * 协议切换时更新 URL 占位符 + 提示文字
    */
   _onFormatChange() {
@@ -1128,9 +1168,13 @@ Please respond concisely to the user's question, keeping answers under three sho
     const cfg = this._getConfig();
     if (!cfg.url) return this._toast('请填写 API Base URL', 'error');
     if (!cfg.apiKey) return this._toast('请填写 API Key', 'error');
-    const selectedModels = cfg.models && cfg.models.length ? cfg.models : (cfg.model ? [cfg.model] : []);
-    if (!selectedModels.length) return this._toast('请填写或选择至少一个模型', 'error');
+    // 无需手动选模型：未选则自动通过接口获取模型列表并测试全部（默认全部 Claude，可关闭「自动全选」改测全部）
+    const selectedModels = await this._resolveModelsForRun(cfg);
+    if (!selectedModels.length) {
+      return this._toast('未能获取可测试的模型：请确认地址/Key 正确，或在「模型名称」手动填写一个模型名', 'error');
+    }
     cfg.model = selectedModels[0];
+    cfg.models = selectedModels;
 
     const enabledPrompts = this.state.prompts.filter(p => p.enabled && p.body.trim());
     if (!enabledPrompts.length) return this._toast('至少启用一个提示词', 'error');
