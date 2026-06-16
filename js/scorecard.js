@@ -431,8 +431,8 @@ const SCORECARD_CHECKS = [
       const r = ctx.paramResults?.toolUse;
       if (!r) return { status: 'skip', detail: 'Tool Use 未运行' };
       if (r.error) return { status: 'fail', detail: '请求失败: ' + r.error.message };
-      if (r.paramPassed) return { status: 'pass', detail: '成功返回 get_weather(Tokyo) 工具调用' };
-      if (r.paramPartial) return { status: 'partial', detail: '返回了工具调用，但名称或参数不完整' };
+      if (r.paramPassed) return { status: 'pass', detail: `成功返回 get_weather(Tokyo) 工具调用${r.toolSchemaValid === false ? '（但 arguments schema 不合法）' : '，arguments schema 合法'}` };
+      if (r.paramPartial) return { status: 'partial', detail: r.toolSchemaValid === false ? '返回了工具调用但 arguments 畸形/不符 schema（量化或降级后端常见）' : '返回了工具调用，但名称或参数不完整' };
       return { status: 'fail', detail: '模型未返回工具调用，可能参数被吞或渠道不支持' };
     }
   },
@@ -860,8 +860,8 @@ const SCORECARD_CHECKS = [
     }
   },
   {
-    id: 'l6_temp0_determinism', layer: 'L6', name: 'temperature=0 重复确定性', weight: 4,
-    desc: '相同 prompt 多次响应应高度相似',
+    id: 'l6_temp0_determinism', layer: 'L6', name: 'temperature=0 重复确定性（弱信号）', weight: 2,
+    desc: '弱信号：相同 prompt 多次响应的相似度。注意——研究证明同权重模型在生产 batch-variance 下贪婪解码也会发散（一致率可 <5%），故发散≠换模型，仅作参考',
     evaluate(ctx) {
       if (ctx.cfg.temperature !== 0) {
         return { status: 'skip', detail: '未以 temperature=0 运行，不能评价 temperature=0 确定性' };
@@ -869,9 +869,74 @@ const SCORECARD_CHECKS = [
       if (!ctx.report?.consistency) return { status: 'skip', detail: '无一致性数据' };
       const sim = ctx.report.consistency.avgSameSim;
       if (sim === null) return { status: 'skip', detail: '无同模型同输入的重复样本' };
-      if (sim >= 0.5) return { status: 'pass', detail: `相似度 ${(sim * 100).toFixed(0)}%` };
-      if (sim >= 0.3) return { status: 'partial', detail: `相似度仅 ${(sim * 100).toFixed(0)}%` };
-      return { status: 'fail', detail: `相似度 ${(sim * 100).toFixed(0)}% — 后端可能分流到不同实例` };
+      // 弱信号：发散不再判 fail（生产端 batch-variance 也会致贪婪解码发散），仅 pass/partial
+      if (sim >= 0.5) return { status: 'pass', detail: `相似度 ${(sim * 100).toFixed(0)}%（高度一致）` };
+      if (sim >= 0.2) return { status: 'partial', detail: `相似度 ${(sim * 100).toFixed(0)}% — 弱信号：可能是后端 batch-variance（非决定性），也可能分流，需结合其它判据` };
+      return { status: 'partial', detail: `相似度仅 ${(sim * 100).toFixed(0)}% — 发散较大但不单独定罪（生产端贪婪解码亦可发散）；建议看 seed/system_fingerprint 与分布检验` };
+    }
+  },
+  {
+    id: 'l1_tokenizer_family', layer: 'L1', name: '分词器家族指纹', weight: 6,
+    desc: '用计费 token 数反推后端分词器家族；声称 Claude 却命中 GPT/SentencePiece 即换后端铁证',
+    evaluate(ctx) {
+      if (!ctx.cfg.advancedEnabled || !ctx.cfg.tokenizerEnabled) return { status: 'skip', detail: '未启用分词器指纹' };
+      const t = ctx.advancedResults?.tokenizer;
+      if (!t) return { status: 'skip', detail: '分词器探针未运行' };
+      if (t.error) return { status: 'skip', detail: t.error };
+      const claimClaude = /claude/i.test(ctx.cfg.model || '');
+      if (claimClaude && /SentencePiece|cl100k/.test(t.family)) {
+        return { status: 'fail', detail: `声称 Claude 但分词器=${t.family}（${t.note}）→ 后端非 Claude` };
+      }
+      if (claimClaude && /o200k/.test(t.family)) {
+        return { status: 'partial', detail: `分词器=${t.family}：与 Claude 不可证伪也不可证实（Claude/GPT-4o 计费相近，看 glitch/分布佐证）` };
+      }
+      return { status: 'pass', detail: `分词器家族=${t.family}（${t.note}），与声称一致或无矛盾` };
+    }
+  },
+  {
+    id: 'l6_glitch_token', layer: 'L6', name: '欠训练(glitch) token 指纹', weight: 4,
+    desc: '发已知 GPT/tiktoken glitch token，复现复读失败=GPT 系后端（软信号）',
+    evaluate(ctx) {
+      if (!ctx.cfg.advancedEnabled || !ctx.cfg.tokenizerEnabled) return { status: 'skip', detail: '未启用' };
+      const g = ctx.advancedResults?.glitch;
+      if (!g || g.error) return { status: 'skip', detail: g?.error || 'glitch 探针未运行' };
+      const claimClaude = /claude/i.test(ctx.cfg.model || '');
+      // glitch 为软信号：即便全部复读失败也只给 partial（现代模型复制能力差异大），不单独定罪
+      if (g.suspectGPT) {
+        return { status: 'partial', detail: `控制串可复读但 ${g.glitchFails}/${g.glitchTotal} 个 GPT glitch 串全部复读失败 → 复现 GPT/tiktoken 特有行为（软信号${claimClaude ? '，与声称 Claude 矛盾，建议结合分词器/分布判据' : ''}）` };
+      }
+      return { status: 'pass', detail: `未见 GPT-glitch 复读失败（glitch 失败 ${g.glitchFails}/${g.glitchTotal}，控制失败 ${g.controlFails}）` };
+    }
+  },
+  {
+    id: 'l1_system_fingerprint', layer: 'L1', name: 'system_fingerprint + seed（OpenAI）', weight: 4,
+    desc: 'OpenAI 协议：固定 seed 下 system_fingerprint 应存在且稳定、输出应一致；中转换后端常缺失/发散',
+    evaluate(ctx) {
+      if (!ctx.cfg.advancedEnabled) return { status: 'skip', detail: '未启用进阶指纹' };
+      if (ctx.cfg.format === 'anthropic') return { status: 'skip', detail: 'Anthropic 协议无 system_fingerprint' };
+      const f = ctx.advancedResults?.fingerprint;
+      if (!f || f.error) return { status: 'skip', detail: f?.error || '未运行' };
+      if (f.hasFingerprint && f.fpStable && f.seedConsistent) return { status: 'pass', detail: `system_fingerprint 稳定 + seed 一致（相似 ${(f.seedSim * 100).toFixed(0)}%）` };
+      if (!f.hasFingerprint) return { status: 'partial', detail: 'system_fingerprint 缺失（中转常剥离；并非所有 OpenAI 兼容端点都返回）' };
+      if (!f.fpStable) return { status: 'fail', detail: 'system_fingerprint 在固定 seed 下抖动 → 后端配置不稳定/分流' };
+      if (!f.seedConsistent) return { status: 'fail', detail: `固定 seed 但输出发散（相似 ${(f.seedSim * 100).toFixed(0)}%）→ 端点忽略 seed/分流` };
+      return { status: 'partial', detail: '部分一致' };
+    }
+  },
+  {
+    id: 'l4_distribution_mmd', layer: 'L4', name: '输出分布检验 (MMD)', weight: 7,
+    desc: '对固定问题各采多条，与可信参考端点做 MMD 置换检验，统计显著差异=量化/微调/换模型',
+    evaluate(ctx) {
+      if (!ctx.cfg.advancedEnabled || !ctx.cfg.distributionEnabled) return { status: 'skip', detail: '未启用分布检验' };
+      const d = ctx.advancedResults?.distribution;
+      if (!d || d.error) return { status: 'skip', detail: d?.error || '未运行' };
+      if (d.mode === 'reference') {
+        if (typeof d.different !== 'boolean') return { status: 'skip', detail: '分布检验结果异常' };
+        return d.different === true
+          ? { status: 'fail', detail: `与参考端点分布显著不同（MMD²=${d.observedMMD}, p=${d.pValue}）→ 疑似量化/微调/换模型` }
+          : { status: 'pass', detail: `与参考端点分布无显著差异（p=${d.pValue}）` };
+      }
+      return { status: 'partial', detail: `仅自一致性（无参考端点）：自 MMD²=${d.selfMMD}。设可信参考端点可升级为换模型检验` };
     }
   }
 ];

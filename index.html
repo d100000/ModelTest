@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>模型保真测试 · Model Fidelity Tester</title>
-<link rel="stylesheet" href="styles.css?v=59" />
+<link rel="stylesheet" href="styles.css?v=60" />
 </head>
 <body>
 <header class="app-header">
@@ -308,6 +308,30 @@
             <span class="toggle-label"><strong>最大输出长度</strong><span class="dim" style="font-size:11px;display:block;margin-left:24px">请求超长连续输出，测实际产出 token 与是否被低位封顶（中转降级常见）</span></span>
           </label>
         </div>
+
+        <label class="suite-toggle">
+          <input type="checkbox" id="cfg-advanced-enable" />
+          <span class="toggle-label">
+            <strong>进阶指纹检测</strong>
+            <span class="dim" style="font-size:11px;display:block;margin-left:24px">分词器家族反推 + 欠训练(glitch) token + system_fingerprint/seed + 分布统计检验，识别「声称 Claude 实为 GPT/量化/换模型」</span>
+          </span>
+        </label>
+        <div id="advanced-config-box" class="suite-config" style="display:none">
+          <label class="suite-toggle">
+            <input type="checkbox" id="cfg-tokenizer-enable" checked />
+            <span class="toggle-label"><strong>分词器家族 + glitch token</strong><span class="dim" style="font-size:11px;display:block;margin-left:24px">用 usage 计费 token 数反推 cl100k/o200k/SentencePiece/Claude 分词器；发欠训练 token 看是否复现 GPT 特有乱码。声称 Claude 却命中 GPT 分词器 = 铁证</span></span>
+          </label>
+          <label class="suite-toggle">
+            <input type="checkbox" id="cfg-distribution-enable" />
+            <span class="toggle-label"><strong>分布统计检验（MMD）</strong><span class="dim" style="font-size:11px;display:block;margin-left:24px">对固定问题各采多条，与「可信参考端点」做 MMD 置换检验，给统计显著性判定量化/微调/换模型；不填参考端点则退化为自一致性</span></span>
+          </label>
+          <div class="suite-config" style="display:block;margin-top:6px">
+            <label class="field"><span class="field-label" style="font-size:11px">可信参考端点 URL（可选，留空则只做自一致性）</span>
+              <input type="text" id="cfg-ref-url" placeholder="https://api.anthropic.com（官方直连做对照）" /></label>
+            <label class="field" style="margin-top:4px"><span class="field-label" style="font-size:11px">参考端点 API Key（可选）</span>
+              <input type="password" id="cfg-ref-key" placeholder="对照端点的 key" autocomplete="off" /></label>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -417,6 +441,11 @@
         <div class="metric-value" id="m-capacity">—</div>
         <div class="metric-sub" id="m-capacity-sub">未启用</div>
       </div>
+      <div class="metric-card" id="advanced-card" style="display:none">
+        <div class="metric-label">进阶指纹</div>
+        <div class="metric-value" id="m-advanced">—</div>
+        <div class="metric-sub" id="m-advanced-sub">未启用</div>
+      </div>
     </section>
 
     <!-- 标签页 -->
@@ -433,6 +462,7 @@
       <button class="tab" data-tab="adversarial" id="adversarial-tab-btn" style="display:none">对抗探针</button>
       <button class="tab" data-tab="capacity" id="capacity-tab-btn" style="display:none">容量能力</button>
       <button class="tab" data-tab="compare" id="compare-tab-btn" style="display:none">⚖ 横向对比</button>
+      <button class="tab" data-tab="advanced" id="advanced-tab-btn" style="display:none">🧬 进阶指纹</button>
       <button class="tab" data-tab="stats">📈 统计图表</button>
     </div>
 
@@ -748,6 +778,18 @@
         </div>
       </div>
 
+      <div class="tab-panel" id="tab-advanced">
+        <div class="card">
+          <header class="card-header">
+            <h3>🧬 进阶指纹检测</h3>
+            <span class="hint">分词器家族 / 欠训练 token / system_fingerprint+seed / 分布统计检验</span>
+          </header>
+          <div class="card-body" id="advanced-analysis">
+            <div class="empty-state">运行进阶指纹检测后显示</div>
+          </div>
+        </div>
+      </div>
+
       <!-- 统计图表 -->
       <div class="tab-panel" id="tab-stats">
         <div class="stats-grid">
@@ -852,13 +894,13 @@
   </div>
 </div>
 
-<script src="js/prompts.js?v=59"></script>
-<script src="js/fingerprints.js?v=59"></script>
-<script src="js/channels.js?v=59"></script>
-<script src="js/scorecard.js?v=59"></script>
-<script src="js/analyzer.js?v=59"></script>
-<script src="js/api.js?v=59"></script>
-<script src="js/charts.js?v=59"></script>
-<script src="js/app.js?v=59"></script>
+<script src="js/prompts.js?v=60"></script>
+<script src="js/fingerprints.js?v=60"></script>
+<script src="js/channels.js?v=60"></script>
+<script src="js/scorecard.js?v=60"></script>
+<script src="js/analyzer.js?v=60"></script>
+<script src="js/api.js?v=60"></script>
+<script src="js/charts.js?v=60"></script>
+<script src="js/app.js?v=60"></script>
 </body>
 </html>

@@ -438,7 +438,7 @@ const Analyzer = {
     const models = [...byModel.keys()];
     if (!models.length) return null;
 
-    const collisions = this._detectCrossModelCollisions(byModel);
+    const { collisions, baseline } = this._detectCrossModelCollisions(byModel);
 
     const list = models.map(model => {
       const rs = byModel.get(model);
@@ -493,7 +493,8 @@ const Analyzer = {
       // 需 ≥2 次碰撞且跨 ≥2 个不同提示词，避免单个身份类问题（各档 Claude 天然雷同）误判
       if (m.collisionCount >= 2 && m.collisionPrompts >= 2) {
         if (verdict === 'genuine') { verdict = 'adulterated'; confidence = 0.68; }
-        reasons.push(`与 ${m.collisionWith.join('、')} 对 ${m.collisionPrompts} 个不同问题输出高度雷同（${m.collisionCount} 次碰撞）→ 疑似同一底座冒充多个模型`);
+        const sig = baseline != null ? `（碰撞相似度 ≥0.9，显著高于跨模型基线 ${(baseline * 100).toFixed(0)}%）` : '';
+        reasons.push(`与 ${m.collisionWith.join('、')} 对 ${m.collisionPrompts} 个不同问题输出高度雷同（${m.collisionCount} 次碰撞）${sig}→ 疑似同一底座冒充多个模型`);
       }
       if (m.detectedFamily && m.detectedFamily.id !== 'claude' && /claude/i.test(m.model)) {
         if (verdict === 'genuine') { verdict = 'adulterated'; confidence = 0.65; }
@@ -508,7 +509,7 @@ const Analyzer = {
     }
 
     return {
-      models: list, collisions, ordering,
+      models: list, collisions, ordering, collisionBaseline: baseline,
       summary: {
         total: list.length,
         genuine: list.filter(m => m.verdict === 'genuine').length,
@@ -534,6 +535,7 @@ const Analyzer = {
       }
     }
     const collisions = [];
+    const allSims = [];  // 全部跨模型同 prompt 相似度 → 求基线（显著性参照）
     for (const [pid, mm] of byPrompt) {
       const entries = [...mm.entries()].filter(([, arr]) => arr.length);
       for (let i = 0; i < entries.length; i++) {
@@ -541,11 +543,16 @@ const Analyzer = {
           const a = entries[i][1].slice().sort((x, y) => y.length - x.length)[0];
           const b = entries[j][1].slice().sort((x, y) => y.length - x.length)[0];
           const sim = this._jaccard(a, b);
+          allSims.push(sim);
           if (sim >= 0.9) collisions.push({ promptId: pid, models: [entries[i][0], entries[j][0]], similarity: +sim.toFixed(2) });
         }
       }
     }
-    return collisions;
+    // 基线 = 「非碰撞」跨模型同题相似度的中位数（排除 ≥0.9 的碰撞，避免基线被碰撞自身抬高，
+    // 真·不同模型应较低；碰撞远高于此即显著）
+    const nonColliding = allSims.filter(s => s < 0.9);
+    const baseline = nonColliding.length ? +nonColliding.slice().sort((a, b) => a - b)[Math.floor(nonColliding.length / 2)].toFixed(3) : null;
+    return { collisions, baseline };
   },
 
   /** 跨模型延迟层级排序：期望 TPS 随档位升高（opus）而降低；坍塌/倒挂为软信号 */

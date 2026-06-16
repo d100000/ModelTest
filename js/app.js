@@ -27,6 +27,7 @@ const App = {
     adversarialResults: [],
     adversarialSummary: null,
     capacityResults: null,  // { context: {...}, output: {...}, channelHint, modelHint }
+    advancedResults: null,  // { tokenizer, glitch, fingerprint, distribution }
     availableModels: [],
     running: false,
     abortController: null,
@@ -120,7 +121,7 @@ const App = {
     const map = [
       ['cfg-cache-enable', '缓存'], ['cfg-conv-enable', '对话连续性'], ['cfg-thinking-enable', '思考链'],
       ['cfg-preset-enable', '预设'], ['cfg-multimodal-enable', '多模态'], ['cfg-param-test-enable', '参数透传'],
-      ['cfg-adversarial-enable', '对抗探针'], ['cfg-capacity-enable', '容量能力']
+      ['cfg-adversarial-enable', '对抗探针'], ['cfg-capacity-enable', '容量能力'], ['cfg-advanced-enable', '进阶指纹']
     ];
     const on = map.filter(([id]) => document.getElementById(id)?.checked).map(([, name]) => name);
     el.innerHTML = on.length
@@ -485,6 +486,14 @@ const App = {
     const capTab = document.getElementById('capacity-tab-btn');
     if (capTab) capTab.style.display = e8 ? '' : 'none';
 
+    const e9 = document.getElementById('cfg-advanced-enable')?.checked;
+    const advBox = document.getElementById('advanced-config-box');
+    if (advBox) advBox.style.display = e9 ? 'block' : 'none';
+    const advCard = document.getElementById('advanced-card');
+    if (advCard) advCard.style.display = e9 ? '' : 'none';
+    const advTab = document.getElementById('advanced-tab-btn');
+    if (advTab) advTab.style.display = e9 ? '' : 'none';
+
     this._updateConfigSummary();
   },
 
@@ -514,7 +523,8 @@ const App = {
     'cfg-preset-enable', 'cfg-multimodal-enable', 'cfg-pdf-test-enable',
     'cfg-param-test-enable', 'cfg-output-format-test-enable', 'cfg-thinking-display-test-enable',
     'cfg-adversarial-enable',
-    'cfg-capacity-enable', 'cfg-context-test-enable', 'cfg-context-1m-enable', 'cfg-output-test-enable'],
+    'cfg-capacity-enable', 'cfg-context-test-enable', 'cfg-context-1m-enable', 'cfg-output-test-enable',
+    'cfg-advanced-enable', 'cfg-tokenizer-enable', 'cfg-distribution-enable', 'cfg-ref-url'],
 
   /**
    * 缓存测试脚本 — 多轮简短对话，只为触发滚动缓存命中
@@ -730,7 +740,12 @@ Please respond concisely to the user's question, keeping answers under three sho
       capacityEnabled: document.getElementById('cfg-capacity-enable')?.checked || false,
       contextTestEnabled: document.getElementById('cfg-context-test-enable')?.checked || false,
       context1mEnabled: document.getElementById('cfg-context-1m-enable')?.checked || false,
-      outputTestEnabled: document.getElementById('cfg-output-test-enable')?.checked || false
+      outputTestEnabled: document.getElementById('cfg-output-test-enable')?.checked || false,
+      advancedEnabled: document.getElementById('cfg-advanced-enable')?.checked || false,
+      tokenizerEnabled: document.getElementById('cfg-tokenizer-enable')?.checked || false,
+      distributionEnabled: document.getElementById('cfg-distribution-enable')?.checked || false,
+      refUrl: document.getElementById('cfg-ref-url')?.value.trim() || '',
+      refKey: document.getElementById('cfg-ref-key')?.value.trim() || ''
     };
   },
 
@@ -1020,7 +1035,8 @@ Please respond concisely to the user's question, keeping answers under three sho
       'cfg-multimodal-enable', 'cfg-pdf-test-enable', 'cfg-param-test-enable',
       'cfg-output-format-test-enable', 'cfg-thinking-display-test-enable',
       'cfg-adversarial-enable',
-      'cfg-capacity-enable', 'cfg-context-test-enable', 'cfg-context-1m-enable', 'cfg-output-test-enable'].forEach(id => {
+      'cfg-capacity-enable', 'cfg-context-test-enable', 'cfg-context-1m-enable', 'cfg-output-test-enable',
+      'cfg-advanced-enable', 'cfg-tokenizer-enable', 'cfg-distribution-enable'].forEach(id => {
       const elx = document.getElementById(id);
       if (elx) elx.addEventListener('change', () => {
         this._onCacheToggle();
@@ -1256,7 +1272,8 @@ Please respond concisely to the user's question, keeping answers under three sho
         cfg.multimodalEnabled ? ['多模态', () => this._runMultimodalTest(cfg)] : null,
         cfg.paramTestEnabled ? ['参数透传', () => this._runParamTests(cfg)] : null,
         cfg.adversarialEnabled ? ['对抗探针', () => this._runAdversarialProbes(cfg)] : null,
-        cfg.capacityEnabled ? ['容量能力', () => this._runCapacityTests(cfg)] : null
+        cfg.capacityEnabled ? ['容量能力', () => this._runCapacityTests(cfg)] : null,
+        cfg.advancedEnabled ? ['进阶指纹', () => this._runAdvancedTests(cfg)] : null
       ].filter(Boolean);
 
       const suiteStatus = new Map(suiteJobs.map(([name]) => [name, '运行中']));
@@ -2060,13 +2077,15 @@ Please respond concisely to the user's question, keeping answers under three sho
     ];
     if (cfg.context1mEnabled) tiers.push({ tokens: 1000000, label: '1M', beta: true });
 
-    const needle = 'MFT-NEEDLE-' + Math.random().toString(36).slice(2, 8).toUpperCase();
+    // 多针：开头/中部/结尾各埋一个口令，召回率比单针更难被特判绕过，也能抓滑窗/静默截断
+    const mk = () => 'MFT-NEEDLE-' + Math.random().toString(36).slice(2, 8).toUpperCase();
+    const needles = [mk(), mk(), mk()];
     const steps = [];
     let maxAccepted = 0, maxRecalled = 0, supports1m = null;
 
     for (const tier of tiers) {
       if (signal?.aborted) break;
-      const step = await this._runOneContextTier(cfg, tier, needle, signal);
+      const step = await this._runOneContextTier(cfg, tier, needles, signal);
       steps.push(step);
       if (step.accepted) maxAccepted = Math.max(maxAccepted, tier.tokens);
       if (step.recalled) maxRecalled = Math.max(maxRecalled, tier.tokens);
@@ -2074,13 +2093,13 @@ Please respond concisely to the user's question, keeping answers under three sho
       // 某档因「上下文过长」被拒，更大的档没必要再试
       if (step.rejectedForLength) break;
     }
-    return { needle, steps, maxAccepted, maxRecalled, supports1m, tested1m: !!cfg.context1mEnabled };
+    return { needle: needles.join(' / '), needles, steps, maxAccepted, maxRecalled, supports1m, tested1m: !!cfg.context1mEnabled };
   },
 
-  async _runOneContextTier(cfg, tier, needle, signal) {
-    const filler = this._buildFillerText(tier.tokens, needle);
-    const prompt = `${filler}\n\n=== TASK ===\nA unique passcode is hidden somewhere in the document above. It looks like "MFT-NEEDLE-XXXXXX". Reply with ONLY that passcode and nothing else.`;
-    const opts = Object.assign({}, cfg, { stream: false, maxTokens: 40, temperature: null });
+  async _runOneContextTier(cfg, tier, needles, signal) {
+    const filler = this._buildFillerText(tier.tokens, needles);
+    const prompt = `${filler}\n\n=== TASK ===\nThree unique passcodes are hidden at different places in the document above. Each looks like "MFT-NEEDLE-XXXXXX". List ALL passcodes you can find, comma-separated, and nothing else.`;
+    const opts = Object.assign({}, cfg, { stream: false, maxTokens: 60, temperature: null });
     if (tier.beta) opts.extraHeaders = Object.assign({}, cfg.extraHeaders, { 'anthropic-beta': 'context-1m-2025-08-07' });
     const body = cfg.format === 'anthropic'
       ? ApiClient._buildAnthropicBody(cfg.model, prompt, opts)
@@ -2093,21 +2112,26 @@ Please respond concisely to the user's question, keeping answers under three sho
     const status = r.response?.status || r.error?.code || 0;
     const errText = (r.error?.message || '') + ' ' + String(r.response?.body || '').slice(0, 400);
     const rejectedForLength = !ok && /(context|token|length|too\s*long|maximum|exceed|prompt is too|413|too many)/i.test(errText);
-    const recalled = ok && new RegExp(needle.replace(/[-]/g, '\\-?'), 'i').test(r.content || '');
+    const content = r.content || '';
+    const recalledCount = ok ? needles.filter(n => new RegExp(n.replace(/[-]/g, '\\-?'), 'i').test(content)).length : 0;
+    const recallRate = ok ? +(recalledCount / needles.length).toFixed(2) : 0;
+    const recalled = recalledCount >= Math.ceil(needles.length / 2); // 多数召回才算通过
     const serverInput = Number(r.inputTokens || 0);
     const estInput = this._estimateTokens(prompt);
     const silentTrunc = ok && serverInput > 0 && estInput > 8000 && serverInput < estInput * 0.5;
     return {
       label: tier.label, tokens: tier.tokens, beta: !!tier.beta,
-      accepted: ok, status, rejectedForLength, recalled, serverInput, estInput, silentTrunc,
+      accepted: ok, status, rejectedForLength, recalled, recalledCount, needleTotal: needles.length, recallRate,
+      serverInput, estInput, silentTrunc,
       latency: r.latency || 0,
-      answer: ok ? String(r.content || '').trim().slice(0, 60) : '',
+      answer: ok ? content.trim().slice(0, 70) : '',
       error: r.error?.message || (ok ? null : `HTTP ${status}`)
     };
   },
 
-  /** 生成约 targetTokens 的填充文本，needle 埋在中间（1 token ≈ 4 英文字符） */
-  _buildFillerText(targetTokens, needle) {
+  /** 生成约 targetTokens 的填充文本，多个 needle 埋在 ~10%/50%/90% 位置（1 token ≈ 4 英文字符） */
+  _buildFillerText(targetTokens, needles) {
+    const list = Array.isArray(needles) ? needles : [needles];
     const targetChars = targetTokens * 4;
     const base = 'The quarterly maintenance log records routine telemetry from sector ';
     const parts = [];
@@ -2118,8 +2142,11 @@ Please respond concisely to the user's question, keeping answers under three sho
       len += line.length;
       i++;
     }
-    const mid = Math.floor(parts.length / 2);
-    parts.splice(mid, 0, `\n>>> IMPORTANT RECORD: The secret passcode is ${needle}. Remember it exactly. <<<\n`);
+    const positions = list.map((_, k) => Math.floor(parts.length * (0.1 + 0.4 * k))); // 10%, 50%, 90%
+    // 从后往前插入，避免前面的插入影响后面的下标
+    for (let k = list.length - 1; k >= 0; k--) {
+      parts.splice(positions[k], 0, `\n>>> IMPORTANT RECORD ${k + 1}: The secret passcode is ${list[k]}. Remember it exactly. <<<\n`);
+    }
     return parts.join('');
   },
 
@@ -2168,6 +2195,213 @@ Please respond concisely to the user's question, keeping answers under three sho
     result.modelHint = modelHint;
   },
 
+  /* ===================== 进阶指纹检测：分词器 / glitch / fingerprint+seed / 分布 ===================== */
+  async _runAdvancedTests(cfg) {
+    const signal = this.state.abortController?.signal;
+    const result = { tokenizer: null, glitch: null, fingerprint: null, distribution: null };
+    this.state.advancedResults = result;
+    if (cfg.tokenizerEnabled && !signal?.aborted) {
+      try { result.tokenizer = await this._runTokenizerProbe(cfg, signal); } catch (e) { result.tokenizer = { error: e.message }; }
+      if (!signal?.aborted) { try { result.glitch = await this._runGlitchProbe(cfg, signal); } catch (e) { result.glitch = { error: e.message }; } }
+    }
+    if (cfg.format !== 'anthropic' && !signal?.aborted) {
+      try { result.fingerprint = await this._runFingerprintSeedProbe(cfg, signal); } catch (e) { result.fingerprint = { error: e.message }; }
+    }
+    if (cfg.distributionEnabled && !signal?.aborted) {
+      try { result.distribution = await this._runDistributionTest(cfg, signal); } catch (e) { result.distribution = { error: e.message }; }
+    }
+    return result;
+  },
+
+  // 60-CJK 探针（常用汉字，BMP 单码元）
+  _cjkProbe: '的一是不了人我在有他这为之大来以个中上们到说国和地也子时道出而要于就下得可你年生自会那后能对着事其里所去行过家十用发天如然作方成者多日都三'.slice(0, 60),
+
+  /** 分词器家族反推：delta-token 法测各类字符串的计费 token 数，按家族行为分类 */
+  async _runTokenizerProbe(cfg, signal) {
+    const BASE = 'Echo the word ok.';
+    const probes = {
+      digits: '1234567890'.repeat(6),          // 60 数字
+      cjk: this._cjkProbe,                       // 60 CJK
+      spaces: ' '.repeat(60),                    // 60 空格
+      letters: 'abcdefghij'.repeat(6)            // 60 字母（基线）
+    };
+    const measure = async (content, id) => {
+      const opts = Object.assign({}, cfg, { stream: false, maxTokens: 4, temperature: null });
+      const body = cfg.format === 'anthropic'
+        ? ApiClient._buildAnthropicBody(cfg.model, content, opts)
+        : ApiClient._buildOpenAIBody(cfg.model, content, opts);
+      const r = await ApiClient.sendCustom(
+        { id: 'tok_' + id, promptId: 'tok_' + id, promptTag: 'tokenizer', promptTitle: '分词器探针:' + id, promptBody: '(delta-token)', testType: 'tokenizer' },
+        body, opts, signal);
+      return (!r.error && Number(r.inputTokens) > 0) ? Number(r.inputTokens) : null;
+    };
+    const baseTok = await measure(BASE, 'base');
+    if (!baseTok) return { error: '端点未返回 usage.input_tokens，无法做分词器指纹', baseTok };
+    const ratios = {};
+    for (const [k, p] of Object.entries(probes)) {
+      if (signal?.aborted) break;
+      const t = await measure(BASE + '\n' + p, k);
+      const chars = [...p].length;
+      ratios[k] = t ? { delta: t - baseTok, chars, ratio: +(((t - baseTok - 1) / chars)).toFixed(3) } : null;
+    }
+    const dr = ratios.digits?.ratio, cr = ratios.cjk?.ratio;
+    let family = '未知', note = '', confidence = 0.4;
+    if (dr != null && cr != null) {
+      if (dr >= 0.8) { family = 'SentencePiece 系（Llama/Mistral 等，数字按位拆分）'; note = `数字 ${dr}/字`; confidence = 0.8; }
+      else if (cr >= 1.45) { family = 'GPT cl100k 系（GPT-3.5/4，CJK 低效）'; note = `CJK ${cr}/字`; confidence = 0.75; }
+      else if (cr >= 0.95) { family = 'o200k(GPT-4o) / 同级高效 BPE'; note = `CJK ${cr}/字，数字 ${dr}/字`; confidence = 0.5; }
+      else { family = 'Claude / Qwen 等高效 BPE'; note = `CJK ${cr}/字，数字分组`; confidence = 0.55; }
+    }
+    return { baseTok, ratios, family, note, confidence, digitRatio: dr, cjkRatio: cr };
+  },
+
+  /** 欠训练(glitch) token 探针：发已知 GPT/tiktoken glitch token，看是否复现家族特有的复读失败 */
+  async _runGlitchProbe(cfg, signal) {
+    const glitches = [' SolidGoldMagikarp', ' petertodd', ' externalToEVA'];
+    const controls = [' watermelon', ' telephone'];
+    const ask = async (tok, id) => {
+      const prompt = `Repeat the following text exactly once, verbatim, with no quotes and no extra words:\n${tok}`;
+      const opts = Object.assign({}, cfg, { stream: false, maxTokens: 24, temperature: null });
+      const body = cfg.format === 'anthropic'
+        ? ApiClient._buildAnthropicBody(cfg.model, prompt, opts)
+        : ApiClient._buildOpenAIBody(cfg.model, prompt, opts);
+      const r = await ApiClient.sendCustom(
+        { id: 'glitch_' + id, promptId: 'glitch_' + id, promptTag: 'tokenizer', promptTitle: 'glitch:' + tok.trim(), promptBody: prompt, testType: 'glitch' },
+        body, opts, signal);
+      const echoed = !r.error && new RegExp(tok.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i').test(r.content || '');
+      return { tok: tok.trim(), echoed, content: (r.content || '').slice(0, 80), error: r.error?.message || null };
+    };
+    const g = []; for (let i = 0; i < glitches.length; i++) { if (signal?.aborted) break; g.push(await ask(glitches[i], 'g' + i)); }
+    const c = []; for (let i = 0; i < controls.length; i++) { if (signal?.aborted) break; c.push(await ask(controls[i], 'c' + i)); }
+    const glitchFails = g.filter(x => !x.echoed && !x.error).length;
+    const controlFails = c.filter(x => !x.echoed && !x.error).length;
+    // 收紧：控制串全部能复读、且 glitch 串「全部」复读失败，才算复现 GPT glitch 行为
+    // （现代模型常能逐字复制；只要有一个 glitch 能复读就不判，避免误伤）
+    const suspectGPT = controlFails === 0 && g.length >= 2 && glitchFails === g.length;
+    return { glitch: g, control: c, glitchFails, glitchTotal: g.length, controlFails, suspectGPT };
+  },
+
+  /** OpenAI 协议：system_fingerprint + seed 双信号 */
+  async _runFingerprintSeedProbe(cfg, signal) {
+    const prompt = 'In one short sentence, invent a whimsical name for a new color. Output only the sentence.';
+    const send = async (i) => {
+      // 同时请求 logprobs：genuine OpenAI 端点返回；多数中转剥离（透明度信号）
+      const body = JSON.stringify({ model: cfg.model, messages: [{ role: 'user', content: prompt }], max_tokens: 40, temperature: 0, seed: 42, logprobs: true, top_logprobs: 5 });
+      const opts = Object.assign({}, cfg, { stream: false });
+      return ApiClient.sendCustom(
+        { id: 'fpseed_' + i, promptId: 'fpseed_' + i, promptTag: 'tokenizer', promptTitle: 'system_fingerprint/seed', promptBody: prompt, testType: 'fp_seed' },
+        body, opts, signal);
+    };
+    const rs = [];
+    for (let i = 0; i < 3; i++) { if (signal?.aborted) break; rs.push(await send(i)); }
+    const ok = rs.filter(r => !r.error && r.response?.ok);
+    if (!ok.length) return { error: '请求失败，无法采集 fingerprint/seed' };
+    const fps = ok.map(r => r.rawResponse?.system_fingerprint).filter(Boolean);
+    const hasFingerprint = fps.length > 0;
+    const fpStable = hasFingerprint && new Set(fps).size === 1 && fps.length === ok.length;
+    const texts = ok.map(r => r.content || '');
+    let sim = 1;
+    if (texts.length >= 2) {
+      const pairs = [];
+      for (let i = 0; i < texts.length; i++) for (let j = i + 1; j < texts.length; j++) pairs.push(this._safeJaccard(texts[i], texts[j]));
+      sim = pairs.length ? pairs.reduce((a, b) => a + b, 0) / pairs.length : 1;
+    }
+    const seedConsistent = sim >= 0.7;
+    // logprobs 可用性 + 平均所选 token 概率
+    const lp = ok[0]?.rawResponse?.choices?.[0]?.logprobs?.content;
+    const logprobsAvailable = Array.isArray(lp) && lp.length > 0;
+    let avgTopProb = null;
+    if (logprobsAvailable) {
+      const probs = lp.map(tk => Math.exp(Number(tk.logprob))).filter(x => x > 0 && x <= 1);
+      avgTopProb = probs.length ? +(probs.reduce((a, b) => a + b, 0) / probs.length).toFixed(2) : null;
+    }
+    return { hasFingerprint, fingerprints: [...new Set(fps)], fpStable, seedConsistent, seedSim: +sim.toFixed(2), samples: ok.length, logprobsAvailable, avgTopProb };
+  },
+
+  _safeJaccard(a, b) {
+    const tri = s => { const set = new Set(); const t = (s || '').toLowerCase().replace(/\s+/g, ' ').trim(); for (let i = 0; i < t.length - 2; i++) set.add(t.slice(i, i + 3)); return set; };
+    const sa = tri(a), sb = tri(b);
+    if (!sa.size && !sb.size) return 1;
+    let inter = 0; for (const x of sa) if (sb.has(x)) inter++;
+    const uni = sa.size + sb.size - inter;
+    return uni ? inter / uni : 0;
+  },
+
+  /** MMD 两样本分布检验（trigram-jaccard 核 + 置换检验）。有参考端点则跨端点比，否则做自一致性 */
+  async _runDistributionTest(cfg, signal) {
+    const prompts = [
+      'Write one sentence about the sea.',
+      'Name three fruits, comma separated.',
+      'Explain gravity in one sentence.',
+      'Give a short tip for better sleep.',
+      'Translate "good morning" into French.',
+      'Complete: The best way to learn is'
+    ];
+    const N = 3;
+    const sampleFrom = async (url, key, tag) => {
+      const out = [];
+      const o = Object.assign({}, cfg, { url: url || cfg.url, apiKey: key || cfg.apiKey, stream: false, maxTokens: 64, temperature: 1 });
+      for (const p of prompts) {
+        for (let i = 0; i < N; i++) {
+          if (signal?.aborted) return out;
+          const body = cfg.format === 'anthropic' ? ApiClient._buildAnthropicBody(cfg.model, p, o) : ApiClient._buildOpenAIBody(cfg.model, p, o);
+          const r = await ApiClient.sendCustom(
+            { id: `dist_${tag}_${out.length}`, promptId: 'dist_' + tag, promptTag: 'distribution', promptTitle: '分布采样:' + tag, promptBody: p, testType: 'distribution' },
+            body, o, signal);
+          if (!r.error && (r.content || '').trim()) out.push({ p, text: r.content });
+        }
+      }
+      return out;
+    };
+    const target = await sampleFrom(cfg.url, cfg.apiKey, 'target');
+    if (target.length < 6) return { error: '目标端点采样不足', n: target.length };
+
+    const kernelMMD = (A, B) => {
+      // 仅比较同 prompt 的样本，避免跨题材噪声；对每个 prompt 求 MMD^2 再平均
+      const byP = arr => { const m = new Map(); for (const x of arr) { if (!m.has(x.p)) m.set(x.p, []); m.get(x.p).push(x.text); } return m; };
+      const ma = byP(A), mb = byP(B);
+      let acc = 0, cnt = 0;
+      for (const p of ma.keys()) {
+        if (!mb.has(p)) continue;
+        const xa = ma.get(p), xb = mb.get(p);
+        const mean = (u, v, same) => { let s = 0, c = 0; for (let i = 0; i < u.length; i++) for (let j = 0; j < v.length; j++) { if (same && i === j) continue; s += this._safeJaccard(u[i], v[j]); c++; } return c ? s / c : 0; };
+        const kxx = mean(xa, xa, true), kyy = mean(xb, xb, true), kxy = mean(xa, xb, false);
+        acc += (kxx + kyy - 2 * kxy); cnt++;
+      }
+      return cnt ? acc / cnt : 0;
+    };
+
+    if (cfg.refUrl && cfg.refKey) {
+      const ref = await sampleFrom(cfg.refUrl, cfg.refKey, 'ref');
+      if (ref.length < 6) return { mode: 'reference', error: '参考端点采样不足', n: ref.length };
+      const observed = kernelMMD(target, ref);
+      // 置换检验：合并后做种子化 Fisher-Yates 重排，统计 MMD ≥ observed 的比例
+      const pool = target.concat(ref);
+      const seededShuffle = (arr, seed) => {
+        const a = arr.slice(); let s = (seed * 2654435761) >>> 0;
+        for (let i = a.length - 1; i > 0; i--) {
+          s = (s * 1664525 + 1013904223) >>> 0;
+          const j = s % (i + 1);
+          const t = a[i]; a[i] = a[j]; a[j] = t;
+        }
+        return a;
+      };
+      let ge = 0; const PERM = 200;
+      for (let k = 0; k < PERM; k++) {
+        const shuffled = seededShuffle(pool, k + 1);
+        const a = shuffled.slice(0, target.length), b = shuffled.slice(target.length);
+        if (kernelMMD(a, b) >= observed) ge++;
+      }
+      const pValue = +((ge + 1) / (PERM + 1)).toFixed(3);
+      return { mode: 'reference', observedMMD: +observed.toFixed(4), pValue, n: target.length, refN: ref.length, different: pValue < 0.05 };
+    }
+    // 无参考：自一致性（前后两半之间的 MMD 应接近 0）
+    const half = Math.floor(target.length / 2);
+    const a = target.filter((_, i) => i % 2 === 0), b = target.filter((_, i) => i % 2 === 1);
+    const selfMMD = kernelMMD(a, b);
+    return { mode: 'self', selfMMD: +selfMMD.toFixed(4), n: target.length, note: '无参考端点：仅自一致性。MMD≈0 表示内部稳定；明显>0 表示同端点内部不稳定（可能分流/抖动）' };
+  },
+
   _renderCapacityAnalysis(cfg) {
     const el = document.getElementById('capacity-analysis');
     const mv = document.getElementById('m-capacity');
@@ -2207,7 +2441,7 @@ Please respond concisely to the user's question, keeping answers under three sho
               <tr>
                 <td><b>${this._esc(s.label)}</b>${s.beta ? ' <span class="cap-tag">1M beta</span>' : ''}</td>
                 <td>${s.accepted ? '<span class="cap-ok">✓ 接受</span>' : `<span class="cap-no">✗ ${s.rejectedForLength ? '上下文过长被拒' : 'HTTP ' + s.status}</span>`}</td>
-                <td>${!s.accepted ? '—' : s.recalled ? '<span class="cap-ok">✓ 命中</span>' : '<span class="cap-warn">✗ 未召回</span>'}</td>
+                <td>${!s.accepted ? '—' : s.recalled ? `<span class="cap-ok">✓ ${s.recalledCount ?? ''}/${s.needleTotal ?? ''}</span>` : `<span class="cap-warn">✗ ${s.recalledCount ?? 0}/${s.needleTotal ?? 3}</span>`}</td>
                 <td class="mono">${s.accepted ? (s.serverInput || '—') : '—'}${s.silentTrunc ? ' <span class="cap-warn">截断?</span>' : ''}</td>
                 <td class="mono">${s.accepted ? s.latency + 'ms' : '—'}</td>
                 <td class="dim">${s.accepted && s.answer ? this._esc(s.answer) : this._esc(s.error || '')}</td>
@@ -2246,6 +2480,95 @@ Please respond concisely to the user's question, keeping answers under three sho
       const bits = [];
       if (ctx && ctx.tested1m) bits.push('1M ' + (ctx.supports1m ? '✓' : '✗'));
       if (out && !out.error) bits.push('输出 ' + out.outTokens + 't');
+      ms.textContent = bits.join(' · ') || '已测';
+    }
+  },
+
+  _renderAdvancedAnalysis(cfg) {
+    const el = document.getElementById('advanced-analysis');
+    const mv = document.getElementById('m-advanced');
+    const ms = document.getElementById('m-advanced-sub');
+    if (!el) return;
+    const a = this.state.advancedResults;
+    if (!cfg.advancedEnabled || !a) {
+      el.innerHTML = '<div class="empty-state">未启用进阶指纹检测</div>';
+      if (mv) mv.textContent = '—';
+      if (ms) ms.textContent = cfg.advancedEnabled ? '无数据' : '未启用';
+      return;
+    }
+    const claimClaude = /claude/i.test(cfg.model || '');
+    let html = '';
+
+    // 分词器
+    const t = a.tokenizer;
+    if (t) {
+      if (t.error) {
+        html += `<div class="detail-section"><div class="detail-section-title"><span>分词器家族</span></div><div class="empty-state" style="padding:10px">${this._esc(t.error)}</div></div>`;
+      } else {
+        const gptLike = /GPT|cl100k|o200k|SentencePiece/.test(t.family);
+        const alarm = claimClaude && /SentencePiece|cl100k/.test(t.family);
+        html += `<div class="detail-section">
+          <div class="detail-section-title"><span>分词器家族反推</span></div>
+          <div class="cap-hint ${alarm ? 'cap-hint-channel' : 'cap-hint-model'}">推断：<b>${this._esc(t.family)}</b>${t.note ? `（${this._esc(t.note)}）` : ''} · 置信度 ${(t.confidence * 100).toFixed(0)}%${alarm ? ' ⚠ 声称 Claude 却命中该分词器，疑似换后端' : ''}</div>
+          <table class="capacity-table"><thead><tr><th>探针</th><th>delta token</th><th>字符</th><th>token/字</th></tr></thead><tbody>
+          ${Object.entries(t.ratios || {}).map(([k, v]) => v ? `<tr><td>${k}</td><td class="mono">${v.delta}</td><td class="mono">${v.chars}</td><td class="mono">${v.ratio}</td></tr>` : '').join('')}
+          </tbody></table>
+          <div class="dim" style="font-size:11px;margin-top:4px">数字≈1/字=按位拆(SentencePiece/Llama)；CJK≥1.45/字=GPT cl100k；数字分组+CJK低=Claude/o200k 等高效 BPE。</div>
+        </div>`;
+      }
+    }
+    // glitch
+    const g = a.glitch;
+    if (g && !g.error) {
+      html += `<div class="detail-section">
+        <div class="detail-section-title"><span>欠训练(glitch) token 探针</span></div>
+        <div class="cap-hint ${g.suspectGPT ? 'cap-hint-channel' : ''}">${g.suspectGPT ? '⚠ 控制串可复读、GPT glitch 串复读失败 → 复现 GPT/tiktoken 特有行为，疑似 GPT 系后端' : `glitch 复读失败 ${g.glitchFails}/${g.glitchTotal}，控制串失败 ${g.controlFails} → 未见明显 GPT-glitch 行为`}</div>
+        <div class="dim mono" style="font-size:11px;margin-top:4px">${g.glitch.map(x => `${x.echoed ? '✓' : '✗'} ${this._esc(x.tok)}`).join(' · ')}</div>
+      </div>`;
+    }
+    // fingerprint/seed
+    const f = a.fingerprint;
+    if (f && !f.error) {
+      const bad = f.hasFingerprint === false || f.fpStable === false || f.seedConsistent === false;
+      html += `<div class="detail-section">
+        <div class="detail-section-title"><span>system_fingerprint + seed（OpenAI 协议）</span></div>
+        <div class="cap-hint ${bad ? 'cap-hint-channel' : ''}">
+          system_fingerprint：${f.hasFingerprint ? (f.fpStable ? '<span class="cap-ok">存在且稳定</span>' : '<span class="cap-warn">存在但抖动</span>') + ' ' + (f.fingerprints || []).map(x => this._esc(x)).join(',') : '<span class="cap-no">缺失</span>（中转常剥离）'} ·
+          seed 确定性：${f.seedConsistent ? '<span class="cap-ok">一致</span>' : '<span class="cap-no">发散</span>'}（相似度 ${(f.seedSim * 100).toFixed(0)}%） ·
+          logprobs：${f.logprobsAvailable ? `<span class="cap-ok">可用</span>（平均所选 token 概率 ${f.avgTopProb ?? '—'}）` : '<span class="dim">不可用（中转剥离或不支持）</span>'}
+        </div>
+      </div>`;
+    }
+    // distribution
+    const d = a.distribution;
+    if (d) {
+      if (d.error) {
+        html += `<div class="detail-section"><div class="detail-section-title"><span>分布统计检验 (MMD)</span></div><div class="empty-state" style="padding:10px">${this._esc(d.error)}</div></div>`;
+      } else if (d.mode === 'reference') {
+        html += `<div class="detail-section">
+          <div class="detail-section-title"><span>分布统计检验 (MMD vs 参考端点)</span></div>
+          <div class="cap-hint ${d.different ? 'cap-hint-channel' : 'cap-hint-model'}">MMD²=${d.observedMMD} · p=${d.pValue} · ${d.different ? '<b>显著不同</b>（p<0.05）→ 疑似量化/微调/换模型' : '无显著差异，分布与参考端点一致'}（目标 ${d.n} / 参考 ${d.refN} 样本）</div>
+        </div>`;
+      } else {
+        html += `<div class="detail-section">
+          <div class="detail-section-title"><span>分布自一致性（无参考端点）</span></div>
+          <div class="cap-hint">自一致 MMD²=${d.selfMMD}（${d.n} 样本）· <span class="dim">${this._esc(d.note || '')}</span></div>
+        </div>`;
+      }
+    }
+
+    el.innerHTML = html || '<div class="empty-state">无进阶指纹数据</div>';
+    // 指标卡
+    if (mv) {
+      const famShort = (t && !t.error && t.family) ? String(t.family).split('（')[0].split(' ')[0].slice(0, 12) : '';
+      mv.textContent = famShort || (g ? 'glitch' : '已测');
+    }
+    if (ms) {
+      const bits = [];
+      if (t && !t.error) bits.push('分词器');
+      if (g && g.suspectGPT) bits.push('疑GPT');
+      if (f && f.hasFingerprint === false) bits.push('无fp');
+      if (d && d.mode === 'reference' && d.different) bits.push('分布异常');
       ms.textContent = bits.join(' · ') || '已测';
     }
   },
@@ -2540,6 +2863,8 @@ Please respond concisely to the user's question, keeping answers under three sho
       const blocks = r.toolUseBlocks || (Array.isArray(raw.content) ? raw.content.filter(b => b?.type === 'tool_use') : []);
       const weather = blocks.find(b => b.name === 'get_weather');
       r.toolUseBlocks = blocks;
+      // schema 合法性：input 应是对象且含 string 类型 city（量化/降级后端常产畸形 arguments）
+      r.toolSchemaValid = !!weather && weather.input && typeof weather.input === 'object' && typeof weather.input.city === 'string';
       r.paramPassed = !!weather && /tokyo/i.test(String(weather.input?.city || ''));
       r.paramPartial = blocks.length > 0 && !r.paramPassed;
       r.content = r.content || (blocks.length ? blocks.map(b => `tool_use:${b.name} ${JSON.stringify(b.input || {})}`).join('\n') : '');
@@ -2548,9 +2873,11 @@ Please respond concisely to the user's question, keeping answers under three sho
     const calls = r.toolCalls || raw.choices?.[0]?.message?.tool_calls || [];
     const weather = calls.find(c => c.function?.name === 'get_weather' || c.name === 'get_weather');
     r.toolCalls = calls;
-    let args = '';
-    try { args = JSON.stringify(JSON.parse(weather?.function?.arguments || '{}')); }
+    let args = '', parsedArgs = null;
+    try { parsedArgs = JSON.parse(weather?.function?.arguments || '{}'); args = JSON.stringify(parsedArgs); }
     catch (e) { args = String(weather?.function?.arguments || ''); }
+    // schema 合法性：arguments 必须是可解析 JSON 且含 string 类型 city
+    r.toolSchemaValid = !!weather && parsedArgs && typeof parsedArgs === 'object' && typeof parsedArgs.city === 'string';
     r.paramPassed = !!weather && /tokyo/i.test(args);
     r.paramPartial = calls.length > 0 && !r.paramPassed;
     r.content = r.content || (calls.length ? calls.map(c => `tool_call:${c.function?.name || c.name} ${c.function?.arguments || ''}`).join('\n') : '');
@@ -2740,6 +3067,7 @@ Please respond concisely to the user's question, keeping answers under three sho
     this.state.adversarialResults = [];
     this.state.adversarialSummary = null;
     this.state.capacityResults = null;
+    this.state.advancedResults = null;
     this.state.lastReport = null;
     this.state.runProgress = null;
     this._updateRunProgress();
@@ -2803,7 +3131,8 @@ Please respond concisely to the user's question, keeping answers under three sho
       ['m-multimodal', '—'], ['m-multimodal-sub', '未启用'],
       ['m-param', '—'], ['m-param-sub', '未启用'],
       ['m-adversarial', '—'], ['m-adversarial-sub', '未启用'],
-      ['m-capacity', '—'], ['m-capacity-sub', '未启用']
+      ['m-capacity', '—'], ['m-capacity-sub', '未启用'],
+      ['m-advanced', '—'], ['m-advanced-sub', '未启用']
     ];
     for (const [id, txt] of simpleResets) {
       const el = document.getElementById(id);
@@ -2814,7 +3143,7 @@ Please respond concisely to the user's question, keeping answers under three sho
   _resetAnalysisPanels() {
     ['claim-vs-actual', 'identity-keywords', 'consistency-analysis', 'verdict-details', 'channel-analysis',
       'fingerprint-scores', 'response-list', 'preset-analysis', 'image-analysis', 'pdf-analysis', 'param-analysis',
-      'adversarial-analysis', 'capacity-analysis', 'model-comparison', 'signature-replay-analysis', 'cache-verdict', 'cache-rows']
+      'adversarial-analysis', 'capacity-analysis', 'advanced-analysis', 'model-comparison', 'signature-replay-analysis', 'cache-verdict', 'cache-rows']
       .forEach(id => {
         const el = document.getElementById(id);
         if (el) el.innerHTML = '<div class="empty-state">运行测试后显示</div>';
@@ -2869,6 +3198,7 @@ Please respond concisely to the user's question, keeping answers under three sho
     this._renderParamAnalysis(cfg);
     this._renderAdversarialAnalysis(cfg);
     this._renderCapacityAnalysis(cfg);
+    this._renderAdvancedAnalysis(cfg);
     this._renderModelComparison(report);
     // 综合评分（基于上述所有数据汇总）
     this._renderScorecard(cfg, report);
@@ -2956,6 +3286,7 @@ Please respond concisely to the user's question, keeping answers under three sho
       adversarialResults: this.state.adversarialResults || [],
       adversarialSummary: this.state.adversarialSummary,
       capacityResults: this.state.capacityResults,
+      advancedResults: this.state.advancedResults,
       modelVerdicts: report.modelVerdicts,
       report, cfg
     });
