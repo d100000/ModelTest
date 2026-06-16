@@ -716,6 +716,44 @@ const SCORECARD_CHECKS = [
       return { status: 'pass', detail: `延迟指标: ${metrics || '无数据'}` };
     }
   },
+  {
+    id: 'l4_model_name_swap', layer: 'L4', name: '偷换模型名检测', weight: 8,
+    desc: '横向对比：API 返回的 model 字段档位/家族是否与声称一致（不一致=偷换）',
+    evaluate(ctx) {
+      const mv = ctx.modelVerdicts;
+      if (!mv || mv.models.length < 1) return { status: 'skip', detail: '无多模型对比数据' };
+      const swapped = mv.models.filter(m => m.verdict === 'name_swap');
+      if (swapped.length) return { status: 'fail', detail: `${swapped.length} 个模型被偷换名：${swapped.map(m => `${m.model}→${m.echoMode || '?'}`).join('；')}` };
+      const haveEcho = mv.models.filter(m => m.echoMode);
+      if (!haveEcho.length) return { status: 'partial', detail: '上游未回显 model 字段，无法核对偷换' };
+      return { status: 'pass', detail: `${haveEcho.length} 个模型返回档位均与声称一致` };
+    }
+  },
+  {
+    id: 'l4_cross_model_collision', layer: 'L4', name: '跨模型输出碰撞', weight: 8,
+    desc: '不同模型对同一问题输出高度雷同 → 疑似同一底座冒充多个模型（掺假）',
+    evaluate(ctx) {
+      const mv = ctx.modelVerdicts;
+      if (!mv || mv.models.length < 2) return { status: 'skip', detail: '需要 ≥2 个模型对比' };
+      const colliders = mv.models.filter(m => m.collisionCount >= 2);
+      if (colliders.length) return { status: 'fail', detail: `${colliders.map(m => m.model).join('、')} 与其它模型输出高度雷同，疑似同一底座` };
+      if (mv.collisions.length) return { status: 'partial', detail: `存在 ${mv.collisions.length} 处单次碰撞（未达 ≥2 阈值，可能巧合）` };
+      return { status: 'pass', detail: '各模型输出有区分度，无同底座碰撞' };
+    }
+  },
+  {
+    id: 'l4_adulteration_summary', layer: 'L4', name: '横向对比掺假汇总', weight: 6,
+    desc: '综合偷换名/碰撞/指纹/延迟，判定本批模型整体是否掺假',
+    evaluate(ctx) {
+      const mv = ctx.modelVerdicts;
+      if (!mv || mv.models.length < 2) return { status: 'skip', detail: '需要 ≥2 个模型对比' };
+      const s = mv.summary;
+      const bad = s.name_swap + s.adulterated;
+      if (bad > 0) return { status: 'fail', detail: `${s.total} 个模型中 ${bad} 个掺假/偷换（偷换 ${s.name_swap}·掺假 ${s.adulterated}·可疑 ${s.suspicious}）` };
+      if (s.suspicious > 0) return { status: 'partial', detail: `${s.suspicious} 个模型可疑（软信号），其余真实` };
+      return { status: 'pass', detail: `${s.total} 个模型横向对比均未发现掺假/偷换` };
+    }
+  },
 
   // ===== L5 密码学验证 =====
   {

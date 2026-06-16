@@ -80,6 +80,9 @@ const Analyzer = {
       multiModel: (ctx.modelsCount || 1) > 1
     });
 
+    // 9. 横向对比：逐模型偷换/掺假判定（多模型时才有意义）
+    const modelVerdicts = this._buildModelVerdicts(successResults);
+
     return {
       claimedModel,
       claimedFp,
@@ -90,6 +93,7 @@ const Analyzer = {
       cutoffMentions,
       perf,
       channelInfo,
+      modelVerdicts,
       verdict
     };
   },
@@ -417,6 +421,172 @@ const Analyzer = {
       ttftSamples: ttfts.length,
       tpsSamples: tpsValues.length
     };
+  },
+
+  /**
+   * 横向对比：按 r.model 分组，逐模型判定「是否偷换模型名 / 是否掺假」。
+   * 强信号(HARD)：返回 model 的层级/家族 != 声称（偷换）；跨模型输出高度雷同（同底座）。
+   * 软信号：延迟层级排序坍塌（需样本充足，仅作佐证/suspicious）。
+   */
+  _buildModelVerdicts(successResults) {
+    const byModel = new Map();
+    for (const r of successResults) {
+      const m = r.model || '(default)';
+      if (!byModel.has(m)) byModel.set(m, []);
+      byModel.get(m).push(r);
+    }
+    const models = [...byModel.keys()];
+    if (!models.length) return null;
+
+    const collisions = this._detectCrossModelCollisions(byModel);
+
+    const list = models.map(model => {
+      const rs = byModel.get(model);
+      const tier = this._modelTier(model);
+      const reqIsClaude = /claude/i.test(model);
+      const rawEchoes = rs.map(r => r.returnedModel).filter(Boolean);
+      // 归一化后再算稳定度，避免「同模型不同日期后缀」(claude-opus-4-5 vs ...-20250101) 被误判为分流
+      const normEchoes = rawEchoes.map(e => this._normalizeModelName(e));
+      const echoModeNorm = this._mode(normEchoes);
+      const echoStability = normEchoes.length ? normEchoes.filter(e => e === echoModeNorm).length / normEchoes.length : 1;
+      const echoMode = rawEchoes.find(e => this._normalizeModelName(e) === echoModeNorm) || rawEchoes[0] || '';
+      const echoTier = this._modelTier(echoMode);
+      const echoFp = echoMode && typeof matchClaimedModel === 'function' ? matchClaimedModel(echoMode) : null;
+      const crossFamily = reqIsClaude && echoFp && echoFp.id !== 'claude';
+      const echoMismatch = !!(echoMode && ((tier && echoTier && echoTier !== tier) || crossFamily));
+      const med = arr => { const a = arr.filter(x => x > 0).sort((p, q) => p - q); return a.length ? a[Math.floor(a.length / 2)] : 0; };
+      const p50TTFT = med(rs.map(r => r.ttft));
+      const p50TPS = med(rs.map(r => r.tps));
+      const ttftSamples = rs.filter(r => r.ttft > 0).length;
+      const tpsSamples = rs.filter(r => r.tps > 0).length;
+      const fp = this._scoreAllFingerprints(rs)[0];
+      const detectedFamily = fp && fp.score >= 30 ? { id: fp.id, name: fp.name, score: fp.score } : null;
+      const chTop = (typeof ChannelDetector !== 'undefined') ? (ChannelDetector.aggregate(rs)[0] || null) : null;
+      const myCollisions = collisions.filter(c => c.models.includes(model));
+      const collisionPrompts = new Set(myCollisions.map(c => c.promptId)).size;
+      return {
+        model, tier, samples: rs.length,
+        echoMode, echoStability: +echoStability.toFixed(2), echoTier, echoMismatch, crossFamily,
+        p50TTFT, p50TPS, ttftSamples, tpsSamples,
+        detectedFamily,
+        channelTop: chTop ? { short: chTop.short, count: chTop.count, color: chTop.color } : null,
+        collisionCount: myCollisions.length,
+        collisionPrompts,
+        collisionWith: [...new Set(myCollisions.flatMap(c => c.models).filter(x => x !== model))]
+      };
+    });
+
+    const ordering = this._checkTierOrdering(list);
+
+    for (const m of list) {
+      const reasons = [];
+      let verdict = 'genuine', confidence = 0.6;
+      if (m.echoMismatch) {
+        verdict = 'name_swap'; confidence = 0.85;
+        reasons.push(m.crossFamily
+          ? `API 返回 model="${m.echoMode}"（疑似非 Claude 家族），声称却是 ${m.model} → 偷换模型`
+          : `API 返回 model="${m.echoMode}"（${m.echoTier} 档），与声称的 ${m.tier} 档不一致 → 偷换模型档位`);
+      } else if (m.echoMode && m.tier && m.echoStability < 0.95) {
+        verdict = 'name_swap'; confidence = 0.68;
+        reasons.push(`返回 model 字段在多次请求间不稳定（稳定度 ${(m.echoStability * 100).toFixed(0)}%）→ 疑似多源分流/偷换`);
+      }
+      // 需 ≥2 次碰撞且跨 ≥2 个不同提示词，避免单个身份类问题（各档 Claude 天然雷同）误判
+      if (m.collisionCount >= 2 && m.collisionPrompts >= 2) {
+        if (verdict === 'genuine') { verdict = 'adulterated'; confidence = 0.68; }
+        reasons.push(`与 ${m.collisionWith.join('、')} 对 ${m.collisionPrompts} 个不同问题输出高度雷同（${m.collisionCount} 次碰撞）→ 疑似同一底座冒充多个模型`);
+      }
+      if (m.detectedFamily && m.detectedFamily.id !== 'claude' && /claude/i.test(m.model)) {
+        if (verdict === 'genuine') { verdict = 'adulterated'; confidence = 0.65; }
+        reasons.push(`声称 Claude，但自述指纹更像 ${m.detectedFamily.name}（${m.detectedFamily.score} 分）`);
+      }
+      if (ordering && ordering.collapsed && ordering.involved.includes(m.model) && m.tpsSamples >= 4) {
+        if (verdict === 'genuine') { verdict = 'suspicious'; confidence = 0.55; }
+        reasons.push(`跨模型延迟层级未体现差异（${ordering.detail}）→ 不同档位可能是同一底座（软信号）`);
+      }
+      if (!reasons.length) reasons.push('返回模型层级一致、无跨模型输出碰撞、无指纹矛盾');
+      m.verdict = verdict; m.confidence = +confidence.toFixed(2); m.reasons = reasons;
+    }
+
+    return {
+      models: list, collisions, ordering,
+      summary: {
+        total: list.length,
+        genuine: list.filter(m => m.verdict === 'genuine').length,
+        name_swap: list.filter(m => m.verdict === 'name_swap').length,
+        adulterated: list.filter(m => m.verdict === 'adulterated').length,
+        suspicious: list.filter(m => m.verdict === 'suspicious').length
+      }
+    };
+  },
+
+  /** 跨模型输出碰撞：同一 promptId 下，两个不同模型输出 trigram Jaccard ≥ 0.9（且足够长）视为同底座 */
+  _detectCrossModelCollisions(byModel) {
+    const byPrompt = new Map();
+    for (const [model, rs] of byModel) {
+      for (const r of rs) {
+        const pid = r.promptId || 'NA';
+        const c = (r.content || '').trim();
+        if (c.length < 80) continue; // 短答案（如固定身份语）天然雷同，排除以防误报
+        if (!byPrompt.has(pid)) byPrompt.set(pid, new Map());
+        const mm = byPrompt.get(pid);
+        if (!mm.has(model)) mm.set(model, []);
+        mm.get(model).push(c);
+      }
+    }
+    const collisions = [];
+    for (const [pid, mm] of byPrompt) {
+      const entries = [...mm.entries()].filter(([, arr]) => arr.length);
+      for (let i = 0; i < entries.length; i++) {
+        for (let j = i + 1; j < entries.length; j++) {
+          const a = entries[i][1].slice().sort((x, y) => y.length - x.length)[0];
+          const b = entries[j][1].slice().sort((x, y) => y.length - x.length)[0];
+          const sim = this._jaccard(a, b);
+          if (sim >= 0.9) collisions.push({ promptId: pid, models: [entries[i][0], entries[j][0]], similarity: +sim.toFixed(2) });
+        }
+      }
+    }
+    return collisions;
+  },
+
+  /** 跨模型延迟层级排序：期望 TPS 随档位升高（opus）而降低；坍塌/倒挂为软信号 */
+  _checkTierOrdering(list) {
+    const rank = { haiku: 0, sonnet: 1, opus: 2 };
+    const tiered = list.filter(m => m.tier && rank[m.tier] !== undefined && m.tpsSamples >= 4 && m.p50TPS > 0);
+    if (tiered.length < 2) return null;
+    const sorted = [...tiered].sort((a, b) => rank[a.tier] - rank[b.tier]); // haiku→sonnet→opus
+    let monotonic = true;
+    for (let i = 1; i < sorted.length; i++) {
+      if (sorted[i].p50TPS > sorted[i - 1].p50TPS * 0.75) monotonic = false; // 期望递减，25% 容差吸收采样噪声
+    }
+    return { collapsed: !monotonic, involved: tiered.map(m => m.model), detail: sorted.map(m => `${m.tier} TPS ${m.p50TPS.toFixed(0)}`).join(' → ') };
+  },
+
+  _modelTier(name) {
+    const s = String(name || '').toLowerCase();
+    if (/opus/.test(s)) return 'opus';
+    if (/sonnet/.test(s)) return 'sonnet';
+    if (/haiku/.test(s)) return 'haiku';
+    return null;
+  },
+
+  /** 归一化模型名（去日期/版本/厂商前缀），与 app.js _modelsLookEquivalentForRelay 一致 */
+  _normalizeModelName(s) {
+    return String(s || '').toLowerCase()
+      .replace(/^models\//, '')
+      .replace(/^(anthropic|openai|google|vertex|bedrock|aws)[.:/]/, '')
+      .replace(/-\d{8}(?=$|[-_.:])/g, '')
+      .replace(/-\d{4}-\d{2}-\d{2}(?=$|[-_.:])/g, '')
+      .replace(/[:@]v?\d+$/g, '')
+      .replace(/-latest$/g, '')
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '');
+  },
+
+  _mode(arr) {
+    if (!arr.length) return '';
+    const c = new Map();
+    for (const x of arr) c.set(x, (c.get(x) || 0) + 1);
+    return [...c.entries()].sort((a, b) => b[1] - a[1])[0][0];
   },
 
   /**

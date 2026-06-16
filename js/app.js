@@ -505,7 +505,7 @@ const App = {
 
   /** ========== 配置持久化 ========== */
   _configIds: ['cfg-format', 'cfg-url', 'cfg-key', 'cfg-model', 'cfg-concurrency', 'cfg-rounds',
-    'cfg-local-proxy-enable',
+    'cfg-local-proxy-enable', 'cfg-autoselect-claude',
     'cfg-temp-enable', 'cfg-temp', 'cfg-max-tokens', 'cfg-timeout',
     'cfg-stream-enable',
     'cfg-cache-enable', 'cfg-cache-system', 'cfg-cache-turns',
@@ -817,15 +817,29 @@ Please respond concisely to the user's question, keeping answers under three sho
         return;
       }
       const manual = document.getElementById('cfg-model').value.trim();
+      // 保留用户已有的多选（重新拉取/自动刷新时不丢失选择）
+      const prevSelected = new Set(Array.from(sel.selectedOptions).map(o => o.value));
       sel.innerHTML = this.state.availableModels.map(m => {
         const label = m.name && m.name !== m.id ? `${m.id} · ${m.name}` : m.id;
-        const selected = manual && m.id === manual ? ' selected' : '';
+        const selected = (prevSelected.has(m.id) || (manual && m.id === manual)) ? ' selected' : '';
         return `<option value="${this._esc(m.id)}"${selected}>${this._esc(label)}</option>`;
       }).join('');
       sel.style.display = '';
+      // 横向对比：仅在「首次拉取（此前无任何选择）且用户未手动改过选择」时自动全选 Claude，
+      // 之后的自动刷新/重新拉取不再覆盖用户选择，避免与手动取消选中相互打架。
+      const autoClaudeEl = document.getElementById('cfg-autoselect-claude');
+      const firstPopulate = prevSelected.size === 0 && !this._userTouchedModelSelect;
+      let claudeAuto = 0;
+      if ((!autoClaudeEl || autoClaudeEl.checked) && firstPopulate) {
+        for (const opt of sel.options) {
+          if (/claude/i.test(opt.value)) { opt.selected = true; claudeAuto++; }
+        }
+      }
       hint.className = 'url-preview changed';
-      hint.textContent = `已读取 ${this.state.availableModels.length} 个模型，可按住 Cmd/Ctrl 多选 · ${out.url} · 本地后端`;
-      if (!auto) this._toast(`已读取 ${this.state.availableModels.length} 个模型`, 'success');
+      hint.textContent = `已读取 ${this.state.availableModels.length} 个模型，可按住 Cmd/Ctrl 多选 · ${out.url} · 本地后端`
+        + (claudeAuto ? ` · 已自动全选 ${claudeAuto} 个 Claude 模型做横向对比` : '');
+      if (!auto) this._toast(`已读取 ${this.state.availableModels.length} 个模型${claudeAuto ? `，已全选 ${claudeAuto} 个 Claude 横向对比` : ''}`, 'success');
+      this._saveConfig();
       this._updateTotalRequests();
     } catch (err) {
       sel.style.display = 'none';
@@ -950,8 +964,15 @@ Please respond concisely to the user's question, keeping answers under three sho
       this._resetUrl();
     });
 
+    // 用户手动改动模型多选 → 之后不再自动全选 Claude（尊重用户选择）
+    document.getElementById('cfg-model-list')?.addEventListener('change', () => {
+      this._userTouchedModelSelect = true;
+      this._updateTotalRequests();
+    });
+
     document.getElementById('btn-load-models').addEventListener('click', e => {
       e.preventDefault();
+      this._userTouchedModelSelect = false;  // 手动点「读取列表」视为重新开始，允许自动全选
       this._loadModels();
     });
 
@@ -2749,7 +2770,7 @@ Please respond concisely to the user's question, keeping answers under three sho
   _resetAnalysisPanels() {
     ['claim-vs-actual', 'identity-keywords', 'consistency-analysis', 'verdict-details', 'channel-analysis',
       'fingerprint-scores', 'response-list', 'preset-analysis', 'image-analysis', 'pdf-analysis', 'param-analysis',
-      'adversarial-analysis', 'capacity-analysis', 'signature-replay-analysis', 'cache-verdict', 'cache-rows']
+      'adversarial-analysis', 'capacity-analysis', 'model-comparison', 'signature-replay-analysis', 'cache-verdict', 'cache-rows']
       .forEach(id => {
         const el = document.getElementById(id);
         if (el) el.innerHTML = '<div class="empty-state">运行测试后显示</div>';
@@ -2804,8 +2825,74 @@ Please respond concisely to the user's question, keeping answers under three sho
     this._renderParamAnalysis(cfg);
     this._renderAdversarialAnalysis(cfg);
     this._renderCapacityAnalysis(cfg);
+    this._renderModelComparison(report);
     // 综合评分（基于上述所有数据汇总）
     this._renderScorecard(cfg, report);
+  },
+
+  /** ========== 横向对比（多模型掺假 / 偷换名） ========== */
+  _renderModelComparison(report) {
+    const el = document.getElementById('model-comparison');
+    const tabBtn = document.getElementById('compare-tab-btn');
+    const mv = report.modelVerdicts;
+    if (!el) return;
+    if (!mv || mv.models.length < 2) {
+      if (tabBtn) tabBtn.style.display = 'none';
+      el.innerHTML = (mv && mv.models.length === 1)
+        ? `<div class="empty-state">仅测试了 1 个模型（${this._esc(mv.models[0].model)}）。横向对比需 ≥2 个模型 — 请在「模型名称」里多选（勾选「自动全选 Claude」后读取列表即可）。</div>`
+        : '<div class="empty-state">同时选择 ≥2 个模型并运行后显示横向对比</div>';
+      return;
+    }
+    if (tabBtn) tabBtn.style.display = '';
+    const s = mv.summary;
+    const vlabel = { genuine: '真实', name_swap: '偷换模型名', adulterated: '掺假', suspicious: '可疑' };
+    const summaryBanner = `
+      <div class="compare-summary">
+        共 ${s.total} 个模型横向对比：
+        <span class="cmp-pill genuine">真实 ${s.genuine}</span>
+        <span class="cmp-pill name_swap">偷换名 ${s.name_swap}</span>
+        <span class="cmp-pill adulterated">掺假 ${s.adulterated}</span>
+        <span class="cmp-pill suspicious">可疑 ${s.suspicious}</span>
+      </div>`;
+    const rows = mv.models.map(m => {
+      const echoCell = m.echoMode
+        ? `<span class="mono ${m.echoMismatch ? 'cap-no' : ''}">${this._esc(m.echoMode)}</span>`
+        : '<span class="dim">—</span>';
+      return `<tr>
+        <td><b>${this._esc(m.model)}</b></td>
+        <td>${echoCell}</td>
+        <td><span class="cmp-pill ${m.verdict}" data-tip="${this._modelVerdictTip(m)}">${vlabel[m.verdict] || m.verdict} ${(m.confidence * 100).toFixed(0)}%</span></td>
+        <td>${m.detectedFamily ? this._esc(m.detectedFamily.name) : '<span class="dim">—</span>'}</td>
+        <td class="mono">${m.p50TTFT ? Math.round(m.p50TTFT) + 'ms' : '—'}</td>
+        <td class="mono">${m.p50TPS ? m.p50TPS.toFixed(0) : '—'}</td>
+        <td>${m.channelTop ? `<span style="color:${m.channelTop.color || 'inherit'}">${this._esc(m.channelTop.short)}</span>` : '<span class="dim">—</span>'}</td>
+        <td class="${m.collisionCount >= 2 ? 'cap-no' : ''}">${m.collisionCount || 0}</td>
+      </tr>`;
+    }).join('');
+    const orderNote = mv.ordering
+      ? `<div class="compare-note ${mv.ordering.collapsed ? 'warn' : ''}">跨模型延迟层级：${this._esc(mv.ordering.detail)} ${mv.ordering.collapsed ? '— 未体现档位差异（软信号，需结合返回名/碰撞判断）' : '— 符合档位预期（opus 慢于 sonnet 慢于 haiku）'}</div>`
+      : '';
+    const collisionNote = mv.collisions.length
+      ? `<div class="compare-note warn">跨模型输出碰撞：${mv.collisions.map(c => `${this._esc(c.models.join(' ≈ '))}（相似 ${(c.similarity * 100).toFixed(0)}% @ ${this._esc(c.promptId)}）`).join('；')}</div>`
+      : '';
+    el.innerHTML = summaryBanner + `
+      <table class="compare-table">
+        <thead><tr><th>声称模型</th><th>返回 echo</th><th>判定</th><th>自述指纹</th><th>TTFT p50</th><th>TPS p50</th><th>渠道</th><th>碰撞</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>` + orderNote + collisionNote +
+      `<div class="dim" style="font-size:11px;margin-top:10px;line-height:1.7">
+        判定逻辑：<b>返回 model 字段档位/家族 ≠ 声称</b> = 偷换模型名（强信号）；<b>跨模型对同一问题输出高度雷同(≥0.9 且 ≥2 次)</b> = 掺假/同一底座冒充；<b>自述指纹更像别的模型</b> = 掺假；<b>延迟层级坍塌</b> = 软信号佐证。鼠标移到「判定」查看每个模型的具体依据。
+      </div>`;
+  },
+
+  _modelVerdictTip(m) {
+    const vlabel = { genuine: '真实', name_swap: '偷换模型名', adulterated: '掺假', suspicious: '可疑' };
+    const cls = m.verdict === 'genuine' ? 'info' : (m.verdict === 'name_swap' || m.verdict === 'adulterated') ? 'fail' : 'warn';
+    const rows = [`<div class="tip-title tip-${cls}">${vlabel[m.verdict] || m.verdict} · 置信度 ${(m.confidence * 100).toFixed(0)}%</div>`];
+    rows.push(`<div class="tip-row"><span class="tip-k">声称</span><span class="tip-v mono">${this._esc(m.model)}</span></div>`);
+    if (m.echoMode) rows.push(`<div class="tip-row"><span class="tip-k">返回</span><span class="tip-v mono">${this._esc(m.echoMode)}（稳定 ${(m.echoStability * 100).toFixed(0)}%）</span></div>`);
+    for (const r of m.reasons) rows.push(`<div class="tip-row"><span class="tip-k">·</span><span class="tip-v">${this._esc(r)}</span></div>`);
+    return encodeURIComponent(rows.join(''));
   },
 
   /** ========== 综合评分卡 (Scorecard) ========== */
@@ -2825,6 +2912,7 @@ Please respond concisely to the user's question, keeping answers under three sho
       adversarialResults: this.state.adversarialResults || [],
       adversarialSummary: this.state.adversarialSummary,
       capacityResults: this.state.capacityResults,
+      modelVerdicts: report.modelVerdicts,
       report, cfg
     });
     this.state.scorecard = sc;
@@ -4257,7 +4345,13 @@ Please respond concisely to the user's question, keeping answers under three sho
       add('info', 'proxy_queued', '后端已排队', `本地后端按上游域名限流，排队等待 ${proxyQueueWait}ms 后转发。`, 'response.headers.x-mft-queue-wait-ms', `${proxyQueueWait}ms`);
     }
     if (!r.error && r.model && r.returnedModel && !this._modelsLookEquivalentForRelay(r.model, r.returnedModel)) {
-      add('warn', 'returned_model_mismatch', '返回模型不同', `请求 model=${r.model}；响应 model=${r.returnedModel}。单纯完整日期后缀不会触发此提示。`, 'request.model → response.model', `${r.model} → ${r.returnedModel}`);
+      const reqTier = (String(r.model).toLowerCase().match(/opus|sonnet|haiku/) || [])[0];
+      const retTier = (String(r.returnedModel).toLowerCase().match(/opus|sonnet|haiku/) || [])[0];
+      if (reqTier && retTier && reqTier !== retTier) {
+        add('fail', 'tier_swap', '档位被偷换', `请求 ${reqTier} 档（${r.model}），但响应返回 ${retTier} 档（${r.returnedModel}）→ 偷换模型档位。`, 'request.model → response.model', `${r.model} → ${r.returnedModel}`);
+      } else {
+        add('warn', 'returned_model_mismatch', '返回模型不同', `请求 model=${r.model}；响应 model=${r.returnedModel}。单纯完整日期后缀不会触发此提示。`, 'request.model → response.model', `${r.model} → ${r.returnedModel}`);
+      }
     }
 
     return anomalies;

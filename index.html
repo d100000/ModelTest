@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>模型保真测试 · Model Fidelity Tester</title>
-<link rel="stylesheet" href="styles.css?v=57" />
+<link rel="stylesheet" href="styles.css?v=58" />
 </head>
 <body>
 <header class="app-header">
@@ -69,6 +69,10 @@
           </span>
           <input type="text" id="cfg-model" placeholder="claude-opus-4-5 / gpt-4o / gpt-4-turbo ..." />
           <select id="cfg-model-list" multiple size="5" style="display:none;margin-top:8px"></select>
+          <label class="suite-toggle" style="margin-top:6px">
+            <input type="checkbox" id="cfg-autoselect-claude" checked />
+            <span class="toggle-label"><strong>读取后自动全选 Claude 模型横向对比</strong><span class="dim" style="font-size:11px;display:block;margin-left:24px">同时测试所有 Claude 档位，对比分析是否掺假 / 偷换模型名</span></span>
+          </label>
           <div id="model-list-hint" class="url-preview"></div>
         </label>
         <div class="grid-2">
@@ -428,6 +432,7 @@
       <button class="tab" data-tab="params" id="param-tab-btn" style="display:none">参数透传</button>
       <button class="tab" data-tab="adversarial" id="adversarial-tab-btn" style="display:none">对抗探针</button>
       <button class="tab" data-tab="capacity" id="capacity-tab-btn" style="display:none">容量能力</button>
+      <button class="tab" data-tab="compare" id="compare-tab-btn" style="display:none">⚖ 横向对比</button>
       <button class="tab" data-tab="stats">📈 统计图表</button>
     </div>
 
@@ -731,6 +736,18 @@
         </div>
       </div>
 
+      <div class="tab-panel" id="tab-compare">
+        <div class="card">
+          <header class="card-header">
+            <h3>⚖ 横向对比（多模型掺假 / 偷换名检测）</h3>
+            <span class="hint">同时测多个 Claude 档位，按返回模型 echo、延迟层级、输出碰撞综合判定</span>
+          </header>
+          <div class="card-body" id="model-comparison">
+            <div class="empty-state">同时选择多个模型并运行后显示横向对比</div>
+          </div>
+        </div>
+      </div>
+
       <!-- 统计图表 -->
       <div class="tab-panel" id="tab-stats">
         <div class="stats-grid">
@@ -835,13 +852,13 @@
   </div>
 </div>
 
-<script src="js/prompts.js?v=57"></script>
-<script src="js/fingerprints.js?v=57"></script>
-<script src="js/channels.js?v=57"></script>
-<script src="js/scorecard.js?v=57"></script>
-<script src="js/analyzer.js?v=57"></script>
-<script src="js/api.js?v=57"></script>
-<script src="js/charts.js?v=57"></script>
-<script src="js/app.js?v=57"></script>
+<script src="js/prompts.js?v=58"></script>
+<script src="js/fingerprints.js?v=58"></script>
+<script src="js/channels.js?v=58"></script>
+<script src="js/scorecard.js?v=58"></script>
+<script src="js/analyzer.js?v=58"></script>
+<script src="js/api.js?v=58"></script>
+<script src="js/charts.js?v=58"></script>
+<script src="js/app.js?v=58"></script>
 </body>
 </html>
