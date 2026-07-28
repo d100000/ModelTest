@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>模型保真测试 · Model Fidelity Tester</title>
-<link rel="stylesheet" href="styles.css?v=60" />
+<link rel="stylesheet" href="styles.css?v=63" />
 </head>
 <body>
 <header class="app-header">
@@ -280,6 +280,14 @@
         </div>
 
         <label class="suite-toggle">
+          <input type="checkbox" id="cfg-identity-focus-enable" checked />
+          <span class="toggle-label">
+            <strong>身份聚焦度（预设提示词判定）</strong>
+            <span class="dim" style="font-size:11px;display:block;margin-left:24px">用中性任务 + 改名扮演 + 不确定性问题，检测模型是否被灌入「你是 Claude」身份预设 —— 过度自证反而说明造假</span>
+          </span>
+        </label>
+
+        <label class="suite-toggle">
           <input type="checkbox" id="cfg-adversarial-enable" />
           <span class="toggle-label">
             <strong>对抗性探针</strong>
@@ -431,6 +439,11 @@
         <div class="metric-value" id="m-param">—</div>
         <div class="metric-sub" id="m-param-sub">未启用</div>
       </div>
+      <div class="metric-card" id="identity-focus-card" style="display:none">
+        <div class="metric-label">身份聚焦度</div>
+        <div class="metric-value" id="m-identity-focus">—</div>
+        <div class="metric-sub" id="m-identity-focus-sub">未启用</div>
+      </div>
       <div class="metric-card" id="adversarial-card" style="display:none">
         <div class="metric-label">对抗探针</div>
         <div class="metric-value" id="m-adversarial">—</div>
@@ -459,6 +472,7 @@
       <button class="tab" data-tab="preset" id="preset-tab-btn" style="display:none">预设提示词</button>
       <button class="tab" data-tab="multimodal" id="multimodal-tab-btn" style="display:none">多模态</button>
       <button class="tab" data-tab="params" id="param-tab-btn" style="display:none">参数透传</button>
+      <button class="tab" data-tab="identity-focus" id="identity-focus-tab-btn" style="display:none">🎭 身份聚焦度</button>
       <button class="tab" data-tab="adversarial" id="adversarial-tab-btn" style="display:none">对抗探针</button>
       <button class="tab" data-tab="capacity" id="capacity-tab-btn" style="display:none">容量能力</button>
       <button class="tab" data-tab="compare" id="compare-tab-btn" style="display:none">⚖ 横向对比</button>
@@ -745,6 +759,18 @@
         </div>
       </div>
 
+      <div class="tab-panel" id="tab-identity-focus">
+        <div class="card">
+          <header class="card-header">
+            <h3>身份聚焦度 / 预设提示词判定</h3>
+            <span class="hint">中性任务泄露 · 改名刚性 · 过度断言</span>
+          </header>
+          <div class="card-body" id="identity-focus-analysis">
+            <div class="empty-state">运行身份聚焦度检测后显示</div>
+          </div>
+        </div>
+      </div>
+
       <div class="tab-panel" id="tab-adversarial">
         <div class="card">
           <header class="card-header"><h3>对抗性探针结果</h3></header>
@@ -894,13 +920,13 @@
   </div>
 </div>
 
-<script src="js/prompts.js?v=60"></script>
-<script src="js/fingerprints.js?v=60"></script>
-<script src="js/channels.js?v=60"></script>
-<script src="js/scorecard.js?v=60"></script>
-<script src="js/analyzer.js?v=60"></script>
-<script src="js/api.js?v=60"></script>
-<script src="js/charts.js?v=60"></script>
-<script src="js/app.js?v=60"></script>
+<script src="js/prompts.js?v=63"></script>
+<script src="js/fingerprints.js?v=63"></script>
+<script src="js/channels.js?v=63"></script>
+<script src="js/scorecard.js?v=63"></script>
+<script src="js/analyzer.js?v=63"></script>
+<script src="js/api.js?v=63"></script>
+<script src="js/charts.js?v=63"></script>
+<script src="js/app.js?v=63"></script>
 </body>
 </html>

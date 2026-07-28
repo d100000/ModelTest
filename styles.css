@@ -1962,3 +1962,59 @@ mark.evidence-flash { animation: evidenceFlash 1.4s ease-out 1; }
   background: var(--bg-input); border-radius: 6px; border-left: 3px solid var(--border);
 }
 .compare-note.warn { border-left-color: var(--warning, #fbbf24); color: var(--warning, #fbbf24); }
+
+/* ===== 身份聚焦度 / 预设提示词判定 ===== */
+.focus-verdict {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  padding: 16px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  margin-bottom: 18px;
+}
+.focus-verdict-score {
+  font-size: 34px;
+  font-weight: 700;
+  line-height: 1;
+  min-width: 68px;
+  text-align: center;
+}
+.focus-verdict-level { font-weight: 600; margin-bottom: 4px; }
+.focus-verdict-desc { font-size: 12px; color: var(--text-dim); line-height: 1.6; }
+.focus-ok   { background: rgba(52,199,89,.08);  border-color: rgba(52,199,89,.35); }
+.focus-ok   .focus-verdict-score { color: var(--success); }
+.focus-low  { background: rgba(255,214,10,.08); border-color: rgba(255,214,10,.35); }
+.focus-low  .focus-verdict-score { color: #ffd60a; }
+.focus-mid  { background: rgba(255,159,10,.08); border-color: rgba(255,159,10,.38); }
+.focus-mid  .focus-verdict-score { color: var(--warning); }
+.focus-high { background: rgba(255,69,58,.10);  border-color: rgba(255,69,58,.42); }
+.focus-high .focus-verdict-score { color: var(--danger); }
+
+.focus-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px;
+  margin-bottom: 18px;
+}
+.focus-metric-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 6px;
+}
+.focus-metric-label { font-size: 12px; font-weight: 600; }
+.focus-metric-value { font-size: 12px; font-variant-numeric: tabular-nums; color: var(--text-dim); }
+.focus-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bg-elevated);
+  overflow: hidden;
+}
+.focus-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: linear-gradient(90deg, #34c759 0%, #ffd60a 45%, #ff453a 100%);
+  transition: width .3s ease;
+}
+.focus-metric-hint { font-size: 11px; color: var(--text-dim); margin-top: 5px; line-height: 1.5; }

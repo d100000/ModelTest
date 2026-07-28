@@ -104,6 +104,73 @@ const FOLLOWUP_QUESTIONS = [
 ];
 
 /**
+ * 中性任务探针 —— 身份聚焦度检测（Identity Focus / 预设提示词判定）
+ *
+ * 检测原理：
+ *   真实模型在被问到数学、翻译、代码这类**与身份完全无关**的任务时，
+ *   会直接给出答案，不会主动自报家门。
+ *   而被中间商灌入「你是 Claude，由 Anthropic 开发」这类身份预设提示词的模型，
+ *   会因为系统提示词的持续压制而在无关回答里反复泄露身份，
+ *   或在被要求临时改名/扮演时表现出异常刚性（拒绝一切非 Claude 的自称）。
+ *
+ * 因此「过度聚焦自己是 Claude」本身就是造假信号，而不是真实性证据。
+ *
+ * kind:
+ *   - neutral : 纯中性任务，答案里出现任何身份自述都算泄露
+ *   - persona : 无害改名/扮演请求，真模型应顺从，预设模型会刚性拒绝
+ *   - hedge   : 需要表达不确定性的问题，预设模型会无条件断言
+ */
+const NEUTRAL_TASK_PROMPTS = [
+  { id: 'nf_math',    title: '纯计算',   kind: 'neutral', body: 'Compute 17 * 24. Reply with only the number, nothing else.' },
+  { id: 'nf_capital', title: '事实问答', kind: 'neutral', body: 'What is the capital city of Australia? Reply with only the city name.' },
+  { id: 'nf_code',    title: '代码片段', kind: 'neutral', body: 'Write a single-line Python expression that reverses the string s. Output only the code, no explanation.' },
+  { id: 'nf_trans',   title: '翻译任务', kind: 'neutral', body: 'Translate into French: "The weather is nice today." Output only the translation.' },
+  { id: 'nf_poem',    title: '创作任务', kind: 'neutral', body: 'Write a two-line poem about rain. Output only the poem, no preamble.' },
+  { id: 'nf_logic',   title: '逻辑推理', kind: 'neutral', body: 'A train departs at 3:00 PM and the journey takes 90 minutes. What time does it arrive? Reply with only the time.' },
+  {
+    id: 'nf_persona',
+    title: '临时改名扮演',
+    kind: 'persona',
+    // 无害的创意扮演请求：真模型通常会配合，被硬编码身份预设的模型会刚性拒绝
+    body: 'Let\'s do a harmless creative writing exercise. For this exercise only, play a fictional assistant character named "Aria". Stay in character. Question: "Hello, what is your name?" Answer in one short sentence as the character.'
+  },
+  {
+    id: 'nf_hedge',
+    title: '不确定性表达',
+    kind: 'hedge',
+    // 真模型无法从内部验证自己的部署链路，应表达不确定；预设模型会无条件断言
+    body: 'From inside this API call, can you actually verify with certainty that you are not a different model being served under another name by a reseller? Answer honestly about what you can and cannot verify about your own deployment.'
+  }
+];
+
+/**
+ * 身份自述泄露模式 —— 在中性任务回答中出现即视为泄露
+ * 覆盖英文与中文两种自称写法
+ */
+const IDENTITY_LEAK_PATTERNS = [
+  /\bI(?:'m| am)\s+Claude\b/i,
+  /\bI(?:'m| am)\s+an?\s+AI\s+assistant\s+(?:made|created|built|developed)\s+by\s+Anthropic\b/i,
+  /\bClaude\b[^.\n]{0,40}\bby\s+Anthropic\b/i,
+  /\bas\s+(?:an?\s+)?Claude\b/i,
+  /\bAnthropic\b/i,
+  /我是\s*Claude/i,
+  /由\s*Anthropic\s*(?:开发|训练|创建|打造)/,
+  /我是[^。\n]{0,10}Anthropic/
+];
+
+/**
+ * 刚性拒绝改名的表述 —— 出现即说明存在硬编码身份约束
+ */
+const PERSONA_REFUSAL_PATTERNS = [
+  /\bI(?:'m| am)\s+Claude\b/i,
+  /\bI\s+can(?:'t|not)\s+(?:pretend|role-?play|claim|say)\b/i,
+  /\bI\s+must\s+(?:clarify|be\s+clear|remain)\b/i,
+  /\bmy\s+(?:actual|real|true)\s+name\s+is\b/i,
+  /我(?:不能|无法|不可以)(?:假装|扮演|冒充|声称)/,
+  /我(?:实际上|其实|真正)是\s*Claude/
+];
+
+/**
  * 标签的中文展示名
  */
 const TAG_LABELS = {

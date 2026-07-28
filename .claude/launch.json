@@ -2,6 +2,12 @@
   "version": "0.0.1",
   "configurations": [
     {
+      "name": "proxy",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["server.py", "--port", "8000"],
+      "port": 8000
+    },
+    {
       "name": "static",
       "runtimeExecutable": "python3",
       "runtimeArgs": ["-m", "http.server", "8765"],

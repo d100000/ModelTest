@@ -561,6 +561,24 @@ const SCORECARD_CHECKS = [
     }
   },
   {
+    id: 'l4_identity_focus', layer: 'L4', name: '无身份预设提示词', weight: 8,
+    desc: '真实模型不会在中性任务中自报家门，也不会刚性拒绝无害改名；过度自证 = 被灌入身份预设',
+    evaluate(ctx) {
+      if (!ctx.cfg.identityFocusEnabled) return { status: 'skip', detail: '未启用身份聚焦度检测' };
+      const s = ctx.identityFocusSummary;
+      if (!s) return { status: 'skip', detail: '无身份聚焦度检测结果' };
+      const parts = [];
+      if (s.leakCount) parts.push(`中性任务泄露 ${s.leakCount}/${s.neutralCount}`);
+      if (s.rigidity > 0) parts.push(`改名刚性 ${(s.rigidity * 100).toFixed(0)}%`);
+      if (s.overAssertion > 0) parts.push(`过度断言 ${(s.overAssertion * 100).toFixed(0)}%`);
+      const tail = parts.length ? '（' + parts.join('，') + '）' : '';
+      if (s.suspicion >= 60) return { status: 'fail', detail: `可疑度 ${s.suspicion} — 高度疑似身份预设提示词${tail}` };
+      if (s.suspicion >= 35) return { status: 'fail', detail: `可疑度 ${s.suspicion} — 疑似身份预设提示词${tail}` };
+      if (s.suspicion >= 15) return { status: 'partial', detail: `可疑度 ${s.suspicion} — 轻微身份聚焦倾向${tail}` };
+      return { status: 'pass', detail: `可疑度 ${s.suspicion} — 未见身份预设迹象，行为符合通用模型` };
+    }
+  },
+  {
     id: 'l4_refusal_style', layer: 'L4', name: '拒答风格签名', weight: 4,
     desc: 'Claude 用 "I apologize" / GPT 用 "I\'m sorry, but"',
     evaluate(ctx) {
