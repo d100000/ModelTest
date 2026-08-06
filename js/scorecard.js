@@ -37,16 +37,19 @@ const SCORECARD_CHECKS = [
         return '未知';
       };
       for (const r of ctx.successResults) {
-        const id = r.rawResponse?.id;
-        if (!id) continue;
         total++;
+        const id = r.rawResponse?.id;
+        if (!id) {
+          counts['缺失'] = (counts['缺失'] || 0) + 1;
+          continue;
+        }
         const type = classify(String(id));
         counts[type] = (counts[type] || 0) + 1;
         if (type !== '未知') known++;
       }
       if (!total) return { status: 'skip', detail: '无可检查 id' };
       const summary = Object.entries(counts).map(([k, v]) => `${k}:${v}`).join(' ');
-      if (known / total >= 0.9) return { status: 'pass', detail: summary };
+      if (known === total) return { status: 'pass', detail: summary };
       if (known / total >= 0.5) return { status: 'partial', detail: summary };
       return { status: 'fail', detail: `多数 id 前缀未知: ${summary}` };
     }
@@ -75,16 +78,16 @@ const SCORECARD_CHECKS = [
     desc: 'body.id 应匹配官方 API / Vertex / Bedrock / OpenAI 兼容 / OpenRouter 的已知前缀',
     evaluate(ctx) {
       let hit = 0, total = 0;
-      const known = /^(?:msg_01|msg_vrtx_|m(?:sg|sq)_bdrk_|chatcmpl-|cmpl-|resp_|gen-)[A-Za-z0-9_.:-]*/i;
+      const known = /^(?:msg_01[A-Za-z0-9]{20,}|msg_vrtx_[A-Za-z0-9_.:-]{3,}|m(?:sg|sq)_bdrk_[A-Za-z0-9_.:-]{3,}|(?:chatcmpl-|cmpl-|resp_)[A-Za-z0-9_.:-]+|gen-[A-Za-z0-9_.:-]+)$/i;
       for (const r of ctx.successResults) {
         const id = r.rawResponse?.id;
-        if (!id) continue;
         total++;
+        if (!id) continue;
         if (known.test(String(id))) hit++;
       }
       if (total === 0) return { status: 'skip', detail: '无可检查 id' };
       const rate = hit / total;
-      if (rate >= 0.95) return { status: 'pass', detail: `${hit}/${total} 个 id 符合已知渠道格式` };
+      if (hit === total) return { status: 'pass', detail: `${hit}/${total} 个 id 符合已知渠道格式` };
       if (rate >= 0.5) return { status: 'partial', detail: `${hit}/${total} 个 id 符合已知渠道格式` };
       return { status: 'fail', detail: `${hit}/${total} 个 id 符合已知格式 — 多数被代理改写或隐藏` };
     }
@@ -564,6 +567,20 @@ const SCORECARD_CHECKS = [
     id: 'l4_identity_focus', layer: 'L4', name: '无身份预设提示词', weight: 8,
     desc: '真实模型不会在中性任务中自报家门，也不会刚性拒绝无害改名；过度自证 = 被灌入身份预设',
     evaluate(ctx) {
+      if (ctx.report?.verdict?.fixedIdentityResponse) {
+        const models = ctx.report.fixedIdentityAnswers?.models || [];
+        return {
+          status: 'fail',
+          detail: `身份探测回答完全固定：${models.map(x => `${x.model}×${x.samples}`).join('、') || '至少 3 次相同回答'}`
+        };
+      }
+      if (ctx.report?.verdict?.claudeOnlyFingerprint) {
+        const claude = ctx.report.fpScores?.find(fp => fp.id === 'claude');
+        return {
+          status: 'fail',
+          detail: `所有非零模型指纹均指向 Claude（${claude?.score || 0} 分），判定存在强制 Claude 身份提示词`
+        };
+      }
       if (!ctx.cfg.identityFocusEnabled) return { status: 'skip', detail: '未启用身份聚焦度检测' };
       const s = ctx.identityFocusSummary;
       if (!s) return { status: 'skip', detail: '无身份聚焦度检测结果' };

@@ -5043,9 +5043,9 @@ Please respond concisely to the user's question, keeping answers under three sho
   _classifyMessageId(id) {
     const s = String(id || '').trim();
     const patterns = [
-      ['Anthropic', /^msg_01[A-Za-z0-9_.:-]+$/i],
-      ['Vertex', /^msg_vrtx_[A-Za-z0-9_.:-]+$/i],
-      ['Bedrock', /^m(?:sg|sq)_bdrk_[A-Za-z0-9_.:-]+$/i],
+      ['Anthropic', /^msg_01[A-Za-z0-9]{20,}$/i],
+      ['Vertex', /^msg_vrtx_[A-Za-z0-9_.:-]{3,}$/i],
+      ['Bedrock', /^m(?:sg|sq)_bdrk_[A-Za-z0-9_.:-]{3,}$/i],
       ['OpenAI兼容', /^(?:chatcmpl-|cmpl-|resp_)[A-Za-z0-9_.:-]+$/i],
       ['OpenRouter', /^gen-[A-Za-z0-9_.:-]+$/i]
     ];
