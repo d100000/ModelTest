@@ -171,7 +171,16 @@ const ApiClient = {
     const targetUrl = this.normalizeModelsUrl(opts.url, opts.format);
     const url = this._modelsRequestUrl(opts.url, opts.format, opts);
     const headers = this._buildHeaders(opts);
-    const res = await fetch(url, { method: 'GET', headers, signal });
+    let res;
+    try {
+      res = await fetch(url, { method: 'GET', headers, signal });
+    } catch (err) {
+      const msg = err?.message || String(err);
+      if (/failed to fetch|networkerror|load failed/i.test(msg)) {
+        throw new Error('本地 Python 后端不可达，请确认 http://127.0.0.1:8000/api/health 可访问后重试');
+      }
+      throw err;
+    }
     const text = await res.text();
     let parsed = null;
     try { parsed = JSON.parse(text); } catch (e) {}

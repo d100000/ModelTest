@@ -31,15 +31,21 @@ Tunables (env vars in `server.py`):
 `.claude/launch.json` is configured for `python3 -m http.server 8765` — used only when previewing the UI itself, NOT for real API calls.
 
 ### Tests
-There is **no test suite**. Validation is done interactively in the browser preview, often by injecting mock `window.fetch` in `mcp__Claude_Preview__preview_eval` to simulate specific HTTP statuses / SSE streams.
+The **JS frontend has no test suite** — validate it interactively in the browser preview, often by injecting a mock `window.fetch` via `mcp__Claude_Preview__preview_eval` to simulate specific HTTP statuses / SSE streams.
+
+The **Python backend is unit-tested**. `test_security.py` exercises `security.py` (slot manager, queue, heartbeat reaping, rate limiter, slider captcha, config loading) against a deterministic fake clock — no network, no real time:
+```bash
+python3 -m unittest test_security -v                     # all
+python3 -m unittest test_security.RateLimiterTests -v    # one class
+```
 
 ## Cache-busting protocol (important when editing JS)
 
 Every `<script>` and `<link>` tag in `index.html` carries `?v=NN`. **When you change any `js/*.js` or `styles.css`, bump the version in `index.html`**, otherwise the browser preview will serve stale code. There is no automatic invalidation.
 
-Current version is grep-able:
+Current versions are grep-able (note: the stylesheet `<link>` and the `js/*.js` `<script>` tags carry **separate** counters and can legitimately drift — bump whichever you touched):
 ```bash
-grep -o '?v=[0-9]*' index.html | head -1
+grep -o '?v=[0-9]*' index.html | sort -u
 ```
 
 ## Architecture (the big picture)
@@ -82,6 +88,15 @@ Every request goes through `ApiClient._requestUrl` → `/api/proxy?target=<encod
 
 This means **`response.headers` in JS contains everything the upstream returned plus those `X-MFT-*` markers**. Channel detection (`channels.js`) leverages this — it can see `anthropic-ratelimit-*`, `request-id`, `cf-ray` etc. that a direct browser fetch couldn't access (no `Access-Control-Expose-Headers` from upstream).
 
+### Security / anti-abuse layer (`security.py`)
+`server.py` is more than a proxy — it imports `security.py`, which gates a public deployment. `server.py` instantiates `CaptchaService`, `SessionManager`, `RateLimiter` from `security.load_config()` and adds endpoints:
+- `/api/captcha/new` + `/api/captcha/verify` — slider CAPTCHA (human verification before a run is allowed); the JS init flow (`App._initSecurity`) drives this.
+- `/api/session/acquire` / `heartbeat` / `release` / `stats` — a concurrency-slot manager with a wait queue. Sessions are reaped if their heartbeat lapses (`heartbeat_timeout_seconds`).
+- `/api/health` — liveness.
+- `RateLimiter` throttles `/api/proxy`, `/api/session/acquire`, `/api/captcha/*` per client and issues temp bans.
+
+Clients are keyed by `security.client_key(ip, X-MFT-Fingerprint)` — the JS sends an `X-MFT-Fingerprint` request header. Config lives in **`mft_security.json`** (and `MFT_*` env overrides); notably `block_private_targets` is an SSRF guard that should be `true` for public deploys and `false` to test a local model. This whole layer is what `test_security.py` covers.
+
 ### SSE streaming with safety
 `ApiClient._consumeSSEStream(res, format, result, onChunk, signal)`:
 - per-`read()` 60-second timeout (prevents infinite hang if upstream goes silent mid-stream)
@@ -92,7 +107,23 @@ This means **`response.headers` in JS contains everything the upstream returned 
 When changing streaming code, preserve the abort/timeout/lock-release patterns — earlier versions caused the entire tool to hang.
 
 ### State container
-`App.state` (in `app.js`) holds **everything**: prompts, results, probeTasks, cacheResults, convResults, thinkingResult, signatureReplayResult, presetResults, multimodalResults, paramResults, plus `running` and `abortController`. There is no Redux/MobX/etc. — direct mutation is intentional.
+`App.state` (in `app.js`) holds **everything** — there is no Redux/MobX/etc., direct mutation is intentional. The result buckets, each fed by its own test suite:
+
+| Field | Suite |
+|---|---|
+| `results[]` / `probeTasks[]` | core identity probes (flat + per-conversation, see concurrency model) |
+| `cacheResults[]` | prompt-caching behaviour |
+| `convResults[]` | conversation-continuity |
+| `thinkingResult` / `signatureReplayResult` | Extended Thinking + cryptographic signature replay (L5) |
+| `presetResults[]` / `presetSummary` | hidden/preset system-prompt detection |
+| `multimodalResults` | `{image, pdf}` capability probes |
+| `paramResults` | `{stopSequences, outputFormat, thinkingDisplay}` |
+| `adversarialResults[]` / `adversarialSummary` | jailbreak / name-swap / adulteration probes |
+| `capacityResults` | context- and output-window capacity probing → `{context, output, channelHint, modelHint}` |
+| `advancedResults` | **advanced fingerprinting** → `{tokenizer, glitch, fingerprint, distribution}` — tokenizer boundary probes, glitch tokens, seed determinism, MMD distribution stats |
+| `availableModels[]` | auto-fetched model list (`ApiClient.fetchModels`; the app tests every model, no manual selection) |
+
+Plus control fields: `running`, `abortController`, `lastReport`, `runProgress`. Each suite has a matching `_render*` in `app.js` and is cleared by `_resetAnalysisPanels` / `_resetMetrics` on a new run.
 
 `App._start()`'s `finally` block must always:
 1. set `state.running = false`
@@ -122,9 +153,11 @@ The `ctx` passed in by `App._renderScorecard` includes: `allResults`, `successRe
 | Change request body shape | `ApiClient._buildOpenAIBody` / `_buildAnthropicBody` / `_buildConversationBody` in `js/api.js` |
 | Change request routing/headers | `_proxyUrl` / `_requestUrl` in `js/api.js`, plus `server.py` if it's a proxy concern |
 | Add a UI tab/section | `index.html` (markup) + `js/app.js` (`_render*` functions + `_resetAnalysisPanels` reset list) |
+| Change anti-abuse limits / captcha / SSRF guard | `mft_security.json` or `MFT_*` env vars (logic in `security.py`, tests in `test_security.py`) |
 
 ## Conventions / gotchas
 
+- **`js/app.js` looks like a *binary* file to `grep`/`file`/`rg`.** It contains 2 raw NUL bytes (~line 917 — a `url + '\0' + key + '\0' + format` dedup signature in `_maybeAutoLoadModels`). Consequences: plain `grep "foo" js/app.js` silently returns **nothing** (exits 1) and `file` reports `data`. **Always search this file with `grep -a`** (or use the Read/Glob tools, which are unaffected). This is a real footgun — it can make a present function look deleted. Functionally harmless (JS permits NUL in string literals) but would be cleaner written as the `'\x00'` escape; don't "fix" it blind without verifying the dedup key still works.
 - **No frameworks.** Use plain DOM APIs in `app.js`. HTML strings are escaped via `App._esc(...)`.
 - **Chinese-aware regex**: model/channel rules use both English (`\b...\b`) and CJK alternatives. CJK chars don't form `\b` boundaries; if you need CJK matching, omit `\b` (see comment in `fingerprints.js` around the Qwen rules).
 - **localStorage keys**: `mft.prompts` (user prompt edits), `mft.config` (config minus API key). API key is **never** persisted.
@@ -136,3 +169,4 @@ The `ctx` passed in by `App._renderScorecard` includes: `allResults`, `successRe
 
 - The proxy log markers (`X-MFT-*` headers) double as channel-detection inputs and operator debug clues.
 - The scorecard report is exportable as JSON via the "下载报告" button in the UI.
+- `README.md` is the long-form (Chinese) explanation of the detection methodology; `docs/检测能力对比与建议.md` is a landscape gap-analysis of where detection is still weak — read it before extending fingerprinting.

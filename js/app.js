@@ -22,6 +22,8 @@ const App = {
     signatureReplayResult: null,
     presetResults: [],     // 预设/隐藏提示词检测结果
     presetSummary: null,
+    identityFocusResults: [],   // 身份聚焦度探针逐条结果（中性任务泄露 / 改名刚性 / 断言过度）
+    identityFocusSummary: null, // { leakRate, rigidity, overAssertion, density, concentration, suspicion, level }
     multimodalResults: {}, // { image, pdf }
     paramResults: {},      // { stopSequences, outputFormat, thinkingDisplay }
     adversarialResults: [],
@@ -120,7 +122,7 @@ const App = {
     if (!el) return;
     const map = [
       ['cfg-cache-enable', '缓存'], ['cfg-conv-enable', '对话连续性'], ['cfg-thinking-enable', '思考链'],
-      ['cfg-preset-enable', '预设'], ['cfg-multimodal-enable', '多模态'], ['cfg-param-test-enable', '参数透传'],
+      ['cfg-preset-enable', '预设'], ['cfg-identity-focus-enable', '身份聚焦'], ['cfg-multimodal-enable', '多模态'], ['cfg-param-test-enable', '参数透传'],
       ['cfg-adversarial-enable', '对抗探针'], ['cfg-capacity-enable', '容量能力'], ['cfg-advanced-enable', '进阶指纹']
     ];
     const on = map.filter(([id]) => document.getElementById(id)?.checked).map(([, name]) => name);
@@ -464,6 +466,12 @@ const App = {
     document.getElementById('preset-card').style.display = e4 ? '' : 'none';
     document.getElementById('preset-tab-btn').style.display = e4 ? '' : 'none';
 
+    const e4b = document.getElementById('cfg-identity-focus-enable')?.checked;
+    const ifCard = document.getElementById('identity-focus-card');
+    if (ifCard) ifCard.style.display = e4b ? '' : 'none';
+    const ifTab = document.getElementById('identity-focus-tab-btn');
+    if (ifTab) ifTab.style.display = e4b ? '' : 'none';
+
     const e5 = document.getElementById('cfg-multimodal-enable')?.checked;
     document.getElementById('multimodal-config-box').style.display = e5 ? 'block' : 'none';
     document.getElementById('multimodal-card').style.display = e5 ? '' : 'none';
@@ -520,7 +528,7 @@ const App = {
     'cfg-cache-enable', 'cfg-cache-system', 'cfg-cache-turns',
     'cfg-conv-enable', 'cfg-conv-turns', 'cfg-conv-delay',
     'cfg-thinking-enable', 'cfg-thinking-budget',
-    'cfg-preset-enable', 'cfg-multimodal-enable', 'cfg-pdf-test-enable',
+    'cfg-preset-enable', 'cfg-identity-focus-enable', 'cfg-multimodal-enable', 'cfg-pdf-test-enable',
     'cfg-param-test-enable', 'cfg-output-format-test-enable', 'cfg-thinking-display-test-enable',
     'cfg-adversarial-enable',
     'cfg-capacity-enable', 'cfg-context-test-enable', 'cfg-context-1m-enable', 'cfg-output-test-enable',
@@ -731,6 +739,7 @@ Please respond concisely to the user's question, keeping answers under three sho
       thinkingEnabled: document.getElementById('cfg-thinking-enable').checked,
       thinkingBudget: parseInt(document.getElementById('cfg-thinking-budget').value) || 2048,
       presetEnabled: document.getElementById('cfg-preset-enable')?.checked || false,
+      identityFocusEnabled: document.getElementById('cfg-identity-focus-enable')?.checked || false,
       multimodalEnabled: document.getElementById('cfg-multimodal-enable')?.checked || false,
       pdfTestEnabled: document.getElementById('cfg-pdf-test-enable')?.checked || false,
       paramTestEnabled: document.getElementById('cfg-param-test-enable')?.checked || false,
@@ -976,6 +985,7 @@ Please respond concisely to the user's question, keeping answers under three sho
     if (cfg.convEnabled) extra += cfg.convTurns || 0;
     if (cfg.thinkingEnabled && cfg.format === 'anthropic') extra += 2; // thinking + signature replay
     if (cfg.presetEnabled) extra += 4;
+    if (cfg.identityFocusEnabled) extra += NEUTRAL_TASK_PROMPTS.length;
     if (cfg.multimodalEnabled) extra += 1 + (cfg.pdfTestEnabled ? 1 : 0);
     if (cfg.paramTestEnabled) {
       extra += 2; // stop_sequences + tool_use
@@ -1031,7 +1041,7 @@ Please respond concisely to the user's question, keeping answers under three sho
       this._loadModels();
     });
 
-    ['cfg-cache-enable', 'cfg-conv-enable', 'cfg-thinking-enable', 'cfg-preset-enable',
+    ['cfg-cache-enable', 'cfg-conv-enable', 'cfg-thinking-enable', 'cfg-preset-enable', 'cfg-identity-focus-enable',
       'cfg-multimodal-enable', 'cfg-pdf-test-enable', 'cfg-param-test-enable',
       'cfg-output-format-test-enable', 'cfg-thinking-display-test-enable',
       'cfg-adversarial-enable',
@@ -1269,6 +1279,7 @@ Please respond concisely to the user's question, keeping answers under three sho
         cfg.convEnabled ? ['对话连续性', () => this._runConversationTest(cfg)] : null,
         cfg.thinkingEnabled ? ['思考链', () => this._runThinkingTest(cfg)] : null,
         cfg.presetEnabled ? ['预设提示词', () => this._runPresetPromptTest(cfg)] : null,
+        cfg.identityFocusEnabled ? ['身份聚焦度', () => this._runIdentityFocusTest(cfg)] : null,
         cfg.multimodalEnabled ? ['多模态', () => this._runMultimodalTest(cfg)] : null,
         cfg.paramTestEnabled ? ['参数透传', () => this._runParamTests(cfg)] : null,
         cfg.adversarialEnabled ? ['对抗探针', () => this._runAdversarialProbes(cfg)] : null,
@@ -1959,6 +1970,189 @@ Please respond concisely to the user's question, keeping answers under three sho
       return result;
     }));
     this.state.presetSummary = this._summarizePresetResults(this.state.presetResults);
+  },
+
+  /** ========== 身份聚焦度检测（判断是否被灌入身份预设提示词） ==========
+   *
+   * 核心假设：真实模型是「通用的」——它会正常回答数学、翻译、代码等任何问题，
+   * 只有在被直接问身份时才谈身份。而被中间商加了「你是 Claude」系统提示词的模型，
+   * 会因为预设的持续压制而表现出三种异常：
+   *   1. 泄露 leak       —— 在与身份无关的回答里主动自报家门
+   *   2. 刚性 rigidity   —— 拒绝无害的临时改名/角色扮演，强行纠正回 Claude
+   *   3. 过度断言 assert —— 对无法自证的部署链路问题给出无条件肯定
+   * 三者越高，说明「过度聚焦自己是 Claude」，反而越可能是假的。
+   */
+  async _runIdentityFocusTest(cfg) {
+    this.state.identityFocusResults = [];
+    this.state.identityFocusSummary = null;
+    const signal = this.state.abortController?.signal;
+
+    const results = [];
+    for (const probe of NEUTRAL_TASK_PROMPTS) {
+      if (signal?.aborted) break;
+      const opts = Object.assign({}, cfg, { stream: false });
+      const body = cfg.format === 'anthropic'
+        ? ApiClient._buildAnthropicBody(cfg.model, probe.body, opts)
+        : ApiClient._buildOpenAIBody(cfg.model, probe.body, opts);
+      const r = await ApiClient.sendCustom(
+        {
+          id: probe.id, promptId: probe.id, promptTag: 'identity_focus',
+          promptTitle: probe.title, promptBody: probe.body, testType: 'identity_focus'
+        },
+        body, opts, signal
+      );
+      r.focusProbe = probe;
+      this._evaluateIdentityFocus(r);
+      results.push(r);
+    }
+
+    this.state.identityFocusResults = results;
+    this.state.identityFocusSummary = this._summarizeIdentityFocus(results);
+  },
+
+  /**
+   * 逐条评估：给每个探针打上 focusStatus / focusDetail / leaked
+   * status 语义（注意与其它套件相反）：
+   *   pass = 行为正常（没有过度聚焦身份）
+   *   fail = 强烈的预设提示词迹象
+   */
+  _evaluateIdentityFocus(r) {
+    const probe = r.focusProbe || {};
+    const content = r.content || '';
+    if (r.error) {
+      r.focusStatus = 'skip';
+      r.focusDetail = '请求失败: ' + (r.error.message || '未知错误');
+      r.leaked = false;
+      return;
+    }
+
+    if (probe.kind === 'neutral') {
+      const hits = IDENTITY_LEAK_PATTERNS.filter(re => re.test(content));
+      r.leaked = hits.length > 0;
+      r.leakHits = hits.length;
+      if (r.leaked) {
+        r.focusStatus = 'fail';
+        r.focusDetail = `中性任务中主动自述身份（命中 ${hits.length} 条模式）—— 典型的身份预设提示词泄露`;
+      } else {
+        r.focusStatus = 'pass';
+        r.focusDetail = '正常作答，未主动提及身份';
+      }
+      return;
+    }
+
+    if (probe.kind === 'persona') {
+      // 必须是「以 Aria 自称」才算顺从；仅提到 Aria（如"我不能扮演名叫 Aria 的助手"）不算
+      const complied = /(?:my name(?:'s| is)|i(?:'m| am)|call me|this is)\s+"?Aria\b/i.test(content)
+        || /^\s*"?Aria\b/i.test(content)
+        || /我(?:叫|是|的名字是)\s*"?Aria/i.test(content);
+      const refused = PERSONA_REFUSAL_PATTERNS.some(re => re.test(content));
+      r.leaked = refused;
+      if (complied && !refused) {
+        r.focusStatus = 'pass';
+        r.focusDetail = '正常配合无害角色扮演（回答为 Aria）—— 无硬编码身份约束';
+      } else if (complied && refused) {
+        r.focusStatus = 'partial';
+        r.focusDetail = '配合扮演但仍强调真实身份为 Claude —— 存在弱身份约束';
+      } else {
+        r.focusStatus = 'fail';
+        r.focusDetail = '拒绝无害改名扮演并强行自称 Claude —— 身份被硬编码锁定';
+      }
+      return;
+    }
+
+    if (probe.kind === 'hedge') {
+      // 真模型应承认无法从内部验证部署链路
+      const hedged = /\b(?:can(?:'t|not)\s+(?:fully\s+)?verify|no\s+way\s+(?:for\s+me\s+)?to\s+(?:verify|confirm)|unable\s+to\s+verify|don'?t\s+have\s+access|no\s+direct\s+access|cannot\s+be\s+certain|from\s+my\s+perspective)\b/i.test(content)
+        || /(?:无法|不能|没有办法)(?:完全|真正|独立)?(?:验证|确认|证实)/.test(content)
+        || /(?:我没有|无法访问)[^。\n]{0,20}(?:权限|访问|途径)/.test(content);
+      const flatAssert = /\bI\s+(?:can\s+)?(?:confirm|assure|guarantee|am\s+certain|am\s+definitely)\b/i.test(content)
+        || /(?:我可以|我能够)(?:确认|保证|向你保证)/.test(content);
+      r.leaked = flatAssert && !hedged;
+      if (hedged) {
+        r.focusStatus = 'pass';
+        r.focusDetail = '如实承认无法从内部验证部署链路 —— 符合真实模型的认知边界';
+      } else if (flatAssert) {
+        r.focusStatus = 'fail';
+        r.focusDetail = '对无法自证的问题给出无条件肯定 —— 预设提示词强制断言的典型表现';
+      } else {
+        r.focusStatus = 'partial';
+        r.focusDetail = '回答含糊，未明确表达认知边界';
+      }
+      return;
+    }
+
+    r.focusStatus = 'skip';
+    r.focusDetail = '未知探针类型';
+  },
+
+  /**
+   * 汇总为「身份预设可疑度」0~100
+   *
+   * 权重设计（越高越可疑）：
+   *   leakRate      40  中性任务泄露率 —— 最直接的证据
+   *   rigidity      30  改名刚性       —— 硬编码身份约束
+   *   overAssertion 15  过度断言       —— 强制自证
+   *   density       15  提及密度       —— 单位文本里的身份词频
+   *
+   * concentration（候选模型评分的集中度）由调用方从 fpScores 传入做二次放大：
+   * 「Claude 100 分而其余全 0」+ 高泄露 = 极可疑。
+   */
+  _summarizeIdentityFocus(results, fpScores) {
+    const valid = results.filter(r => r.focusStatus && r.focusStatus !== 'skip');
+    if (!valid.length) return null;
+
+    const neutral = valid.filter(r => r.focusProbe?.kind === 'neutral');
+    const persona = valid.filter(r => r.focusProbe?.kind === 'persona');
+    const hedge   = valid.filter(r => r.focusProbe?.kind === 'hedge');
+
+    const leakCount = neutral.filter(r => r.leaked).length;
+    const leakRate = neutral.length ? leakCount / neutral.length : 0;
+
+    // 改名刚性：fail=1，partial=0.5
+    const rigidity = persona.length
+      ? persona.reduce((a, r) => a + (r.focusStatus === 'fail' ? 1 : r.focusStatus === 'partial' ? 0.5 : 0), 0) / persona.length
+      : 0;
+
+    const overAssertion = hedge.length
+      ? hedge.reduce((a, r) => a + (r.focusStatus === 'fail' ? 1 : r.focusStatus === 'partial' ? 0.3 : 0), 0) / hedge.length
+      : 0;
+
+    // 身份词密度：中性回答里每千字符出现的身份自述次数，0.5 次/千字符即封顶
+    const totalChars = neutral.reduce((a, r) => a + (r.content || '').length, 0);
+    const totalHits = neutral.reduce((a, r) => a + (r.leakHits || 0), 0);
+    const density = totalChars ? Math.min(1, (totalHits / (totalChars / 1000)) / 0.5) : 0;
+
+    // 候选模型评分集中度：头名遥遥领先且其余接近 0 → 用户观察到的「一枝独秀」形态
+    let concentration = 0;
+    if (Array.isArray(fpScores) && fpScores.length >= 2) {
+      const top = fpScores[0]?.score || 0;
+      const second = fpScores[1]?.score || 0;
+      if (top >= 80) concentration = Math.min(1, (top - second) / 100);
+    }
+
+    let suspicion = Math.round(
+      leakRate * 40 + rigidity * 30 + overAssertion * 15 + density * 15
+    );
+    // 集中度只在已有行为证据时放大，避免"真 Claude 得 100 分"被误判
+    if (suspicion >= 20) suspicion = Math.min(100, Math.round(suspicion * (1 + concentration * 0.25)));
+
+    const level = suspicion >= 60 ? '高度可疑'
+      : suspicion >= 35 ? '可疑'
+      : suspicion >= 15 ? '轻微'
+      : '正常';
+
+    return {
+      total: valid.length,
+      neutralCount: neutral.length,
+      leakCount,
+      leakRate: +leakRate.toFixed(3),
+      rigidity: +rigidity.toFixed(3),
+      overAssertion: +overAssertion.toFixed(3),
+      density: +density.toFixed(3),
+      concentration: +concentration.toFixed(3),
+      suspicion,
+      level
+    };
   },
 
   async _runAdversarialProbes(cfg) {
@@ -3062,6 +3256,8 @@ Please respond concisely to the user's question, keeping answers under three sho
     this.state.signatureReplayResult = null;
     this.state.presetResults = [];
     this.state.presetSummary = null;
+    this.state.identityFocusResults = [];
+    this.state.identityFocusSummary = null;
     this.state.multimodalResults = {};
     this.state.paramResults = {};
     this.state.adversarialResults = [];
@@ -3128,6 +3324,7 @@ Please respond concisely to the user's question, keeping answers under three sho
     const simpleResets = [
       ['m-cache-rate', '—'], ['m-cache-sub', '未启用'],
       ['m-preset', '—'], ['m-preset-sub', '未启用'],
+      ['m-identity-focus', '—'], ['m-identity-focus-sub', '未启用'],
       ['m-multimodal', '—'], ['m-multimodal-sub', '未启用'],
       ['m-param', '—'], ['m-param-sub', '未启用'],
       ['m-adversarial', '—'], ['m-adversarial-sub', '未启用'],
@@ -3142,7 +3339,7 @@ Please respond concisely to the user's question, keeping answers under three sho
 
   _resetAnalysisPanels() {
     ['claim-vs-actual', 'identity-keywords', 'consistency-analysis', 'verdict-details', 'channel-analysis',
-      'fingerprint-scores', 'response-list', 'preset-analysis', 'image-analysis', 'pdf-analysis', 'param-analysis',
+      'fingerprint-scores', 'response-list', 'preset-analysis', 'identity-focus-analysis', 'image-analysis', 'pdf-analysis', 'param-analysis',
       'adversarial-analysis', 'capacity-analysis', 'advanced-analysis', 'model-comparison', 'signature-replay-analysis', 'cache-verdict', 'cache-rows']
       .forEach(id => {
         const el = document.getElementById(id);
@@ -3196,6 +3393,7 @@ Please respond concisely to the user's question, keeping answers under three sho
     this._renderPresetAnalysis(cfg);
     this._renderMultimodalAnalysis(cfg);
     this._renderParamAnalysis(cfg);
+    this._renderIdentityFocus(cfg);
     this._renderAdversarialAnalysis(cfg);
     this._renderCapacityAnalysis(cfg);
     this._renderAdvancedAnalysis(cfg);
@@ -3280,6 +3478,8 @@ Please respond concisely to the user's question, keeping answers under three sho
       thinkingResult: this.state.thinkingResult,
       signatureReplayResult: this.state.signatureReplayResult,
       presetSummary: this.state.presetSummary,
+      identityFocusSummary: this.state.identityFocusSummary,
+      identityFocusResults: this.state.identityFocusResults || [],
       presetResults: this.state.presetResults || [],
       multimodalResults: this.state.multimodalResults || {},
       paramResults: this.state.paramResults || {},
@@ -3920,6 +4120,84 @@ Please respond concisely to the user's question, keeping answers under three sho
             <span class="scorecard-check-status ${x.status}">${statusLabel[x.status]}</span>
           </div>
         `).join('')}
+      </div>
+    `;
+  },
+
+  _renderIdentityFocus(cfg) {
+    const card = document.getElementById('identity-focus-card');
+    const tabBtn = document.getElementById('identity-focus-tab-btn');
+    const panel = document.getElementById('identity-focus-analysis');
+    if (!card || !panel) return;
+    if (!cfg.identityFocusEnabled) {
+      card.style.display = 'none';
+      if (tabBtn) tabBtn.style.display = 'none';
+      return;
+    }
+    card.style.display = '';
+    if (tabBtn) tabBtn.style.display = '';
+
+    const results = this.state.identityFocusResults || [];
+    // 渲染时才有 fpScores，用它把「一枝独秀」的集中度纳入放大系数
+    const s = this._summarizeIdentityFocus(results, this.state.lastReport?.fpScores);
+    this.state.identityFocusSummary = s;
+
+    const mv = document.getElementById('m-identity-focus');
+    const ms = document.getElementById('m-identity-focus-sub');
+    if (!s) {
+      if (mv) mv.textContent = '—';
+      if (ms) ms.textContent = '未运行';
+      panel.innerHTML = '<div class="empty-state">运行身份聚焦度检测后显示</div>';
+      return;
+    }
+    if (mv) mv.textContent = s.level;
+    if (ms) ms.textContent = `可疑度 ${s.suspicion} · 泄露 ${s.leakCount}/${s.neutralCount}`;
+
+    const pct = v => Math.round(v * 100) + '%';
+    const bar = (label, val, hint) => `
+      <div class="focus-metric">
+        <div class="focus-metric-head">
+          <span class="focus-metric-label">${this._esc(label)}</span>
+          <span class="focus-metric-value">${pct(val)}</span>
+        </div>
+        <div class="focus-bar"><div class="focus-bar-fill" style="width:${Math.round(val * 100)}%"></div></div>
+        <div class="focus-metric-hint">${this._esc(hint)}</div>
+      </div>`;
+
+    const statusLabel = { pass: '正常', partial: '存疑', fail: '可疑', skip: '跳过' };
+    const statusIcon = { pass: '✓', partial: '◐', fail: '✕', skip: '·' };
+
+    panel.innerHTML = `
+      <div class="focus-verdict focus-${s.suspicion >= 60 ? 'high' : s.suspicion >= 35 ? 'mid' : s.suspicion >= 15 ? 'low' : 'ok'}">
+        <div class="focus-verdict-score">${s.suspicion}</div>
+        <div class="focus-verdict-body">
+          <div class="focus-verdict-level">身份预设可疑度：${this._esc(s.level)}</div>
+          <div class="focus-verdict-desc">
+            分数越高说明模型越「过度聚焦于证明自己是 Claude」。真实模型在中性任务中不会主动自报家门，
+            也会配合无害的临时改名，并如实承认无法验证自身部署链路。
+            ${s.concentration > 0 ? `候选评分集中度 ${pct(s.concentration)}（头名遥遥领先）已计入放大。` : ''}
+          </div>
+        </div>
+      </div>
+      <div class="focus-metrics">
+        ${bar('中性任务泄露率', s.leakRate, `${s.leakCount}/${s.neutralCount} 个与身份无关的任务中主动提及了 Claude/Anthropic`)}
+        ${bar('改名刚性', s.rigidity, '拒绝无害角色扮演、强行纠正回 Claude 的程度')}
+        ${bar('过度断言', s.overAssertion, '对无法自证的部署链路问题给出无条件肯定的程度')}
+        ${bar('身份词密度', s.density, '中性回答中每千字符的身份自述频次')}
+      </div>
+      <div class="scorecard-checks">
+        ${results.map(r => {
+          const st = r.focusStatus || 'skip';
+          return `
+            <div class="scorecard-check">
+              <span class="scorecard-check-icon ${st}">${statusIcon[st] || '·'}</span>
+              <div>
+                <span class="scorecard-check-name">${this._esc(r.promptTitle || r.id)}</span>
+                <span class="scorecard-check-detail">${this._esc(r.focusDetail || '')} · 输出: ${this._esc((r.content || '').slice(0, 220))}</span>
+              </div>
+              <span class="scorecard-check-status ${st}">${statusLabel[st] || st}</span>
+            </div>`;
+        }).join('')}
       </div>
     `;
   },
@@ -4765,9 +5043,9 @@ Please respond concisely to the user's question, keeping answers under three sho
   _classifyMessageId(id) {
     const s = String(id || '').trim();
     const patterns = [
-      ['Anthropic', /^msg_01[A-Za-z0-9_.:-]+$/i],
-      ['Vertex', /^msg_vrtx_[A-Za-z0-9_.:-]+$/i],
-      ['Bedrock', /^m(?:sg|sq)_bdrk_[A-Za-z0-9_.:-]+$/i],
+      ['Anthropic', /^msg_01[A-Za-z0-9]{20,}$/i],
+      ['Vertex', /^msg_vrtx_[A-Za-z0-9_.:-]{3,}$/i],
+      ['Bedrock', /^m(?:sg|sq)_bdrk_[A-Za-z0-9_.:-]{3,}$/i],
       ['OpenAI兼容', /^(?:chatcmpl-|cmpl-|resp_)[A-Za-z0-9_.:-]+$/i],
       ['OpenRouter', /^gen-[A-Za-z0-9_.:-]+$/i]
     ];
@@ -5673,6 +5951,7 @@ Please respond concisely to the user's question, keeping answers under three sho
         scorecard: this.state.scorecard || null,
         signatureReplay: this._summarizeExtraResult(this.state.signatureReplayResult),
         presetSummary: this.state.presetSummary,
+        identityFocusSummary: this.state.identityFocusSummary,
         adversarialSummary: this.state.adversarialSummary,
         multimodal: {
           image: this._summarizeExtraResult(this.state.multimodalResults.image),

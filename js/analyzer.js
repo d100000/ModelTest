@@ -38,6 +38,8 @@ const Analyzer = {
 
     // 3. 一致性指标
     const consistency = this._analyzeConsistency(successResults);
+    const fixedIdentityAnswers = this._analyzeFixedIdentityAnswers(successResults);
+    const messageIdAssessment = this._analyzeMessageIds(successResults);
 
     // 4. 拒答分析
     const refusalAnalysis = this._analyzeRefusals(successResults);
@@ -76,6 +78,8 @@ const Analyzer = {
       thinkingResult: ctx.thinkingResult,
       signatureReplayResult: ctx.signatureReplayResult,
       perf: perfClaimed,
+      fixedIdentityAnswers,
+      messageIdAssessment,
       // 用户故意一次测多个模型时，跨模型的身份/渠道差异是预期的，不应据此判"分流"
       multiModel: (ctx.modelsCount || 1) > 1
     });
@@ -89,6 +93,8 @@ const Analyzer = {
       fpScores,
       keywords,
       consistency,
+      fixedIdentityAnswers,
+      messageIdAssessment,
       refusalAnalysis,
       cutoffMentions,
       perf,
@@ -179,6 +185,87 @@ const Analyzer = {
 
     scores.sort((a, b) => b.score - a.score);
     return scores;
+  },
+
+  /**
+   * 所有有效模型指纹都只指向 Claude。
+   * 0 分候选不算有效指纹；至少需要 Claude 自身有非零得分。
+   */
+  _isClaudeOnlyFingerprint(fpScores) {
+    if (!Array.isArray(fpScores)) return false;
+    const positive = fpScores.filter(fp => Number(fp?.score) > 0);
+    return positive.length === 1 && positive[0].id === 'claude';
+  },
+
+  /**
+   * 检测身份问题是否每次都返回同一段固定文本。
+   * 按模型分别统计；至少 3 条身份回答才触发，避免两次偶然一致。
+   */
+  _analyzeFixedIdentityAnswers(results) {
+    const identityTags = new Set(['identity', 'language', 'foundation', 'origin']);
+    const byModel = new Map();
+    for (const r of results || []) {
+      if (!identityTags.has(r.promptTag)) continue;
+      const prompt = String(r.promptBody || '');
+      // 明确要求逐字重复的探针不能用来证明回答被固定。
+      if (/repeat\s+your\s+answer\s+exactly|do\s+not\s+change\s+anything|原样重复|逐字重复/i.test(prompt)) continue;
+      const normalized = String(r.content || '')
+        .normalize('NFKC')
+        .toLowerCase()
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (!normalized) continue;
+      const model = r.model || '(default)';
+      if (!byModel.has(model)) byModel.set(model, []);
+      byModel.get(model).push({ normalized, content: String(r.content || '').trim() });
+    }
+
+    const fixedModels = [];
+    for (const [model, answers] of byModel) {
+      const unique = new Set(answers.map(a => a.normalized));
+      if (answers.length >= 3 && unique.size === 1) {
+        fixedModels.push({
+          model,
+          samples: answers.length,
+          response: answers[0].content.slice(0, 300)
+        });
+      }
+    }
+    return { detected: fixedModels.length > 0, models: fixedModels };
+  },
+
+  /**
+   * 检查成功响应的 message id 是否符合已知协议格式。
+   * 缺失和未知前缀都视为存疑，任意一条存疑都会影响最终保真度。
+   */
+  _analyzeMessageIds(results) {
+    const known = /^(?:msg_01[A-Za-z0-9]{20,}|msg_vrtx_[A-Za-z0-9_.:-]{3,}|m(?:sg|sq)_bdrk_[A-Za-z0-9_.:-]{3,}|(?:chatcmpl-|cmpl-|resp_)[A-Za-z0-9_.:-]+|gen-[A-Za-z0-9_.:-]+)$/i;
+    let valid = 0, unknown = 0, missing = 0;
+    const suspiciousIds = [];
+    for (const r of results || []) {
+      const raw = r?.rawResponse?.id;
+      const id = raw == null ? '' : String(raw).trim();
+      if (!id) {
+        missing++;
+      } else if (known.test(id)) {
+        valid++;
+      } else {
+        unknown++;
+        if (suspiciousIds.length < 5) suspiciousIds.push(id);
+      }
+    }
+    const total = valid + unknown + missing;
+    const suspicious = unknown + missing;
+    return {
+      total,
+      valid,
+      unknown,
+      missing,
+      suspicious,
+      suspiciousRate: total ? +(suspicious / total).toFixed(3) : 0,
+      suspiciousIds,
+      hasIssue: suspicious > 0
+    };
   },
 
   /**
@@ -605,7 +692,7 @@ const Analyzer = {
    *  - reasons: 详细依据列表
    *  - detectedModel: 最可能的实际模型 (fpId | null)
    */
-  _verdict({ claimedFp, claimedModel, fpScores, consistency, refusalAnalysis, cutoffMentions, sampleSize, channelInfo, thinkingResult, signatureReplayResult, perf, multiModel }) {
+  _verdict({ claimedFp, claimedModel, fpScores, consistency, refusalAnalysis, cutoffMentions, sampleSize, channelInfo, thinkingResult, signatureReplayResult, perf, fixedIdentityAnswers, messageIdAssessment, multiModel }) {
     const reasons = [];
     let level = 'unknown';
     let confidence = 0;
@@ -623,6 +710,7 @@ const Analyzer = {
 
     const topFp = fpScores[0];
     const secondFp = fpScores[1];
+    const claudeOnlyFingerprint = this._isClaudeOnlyFingerprint(fpScores);
 
     // 检测到的最可能模型
     if (topFp && topFp.score >= 30) {
@@ -896,6 +984,53 @@ const Analyzer = {
       }
     }
 
+    // 11. message id 存疑会直接影响保真度
+    // 任意成功响应缺少 id 或使用未知格式，都不能继续维持“真实”结论。
+    const messageIdIssue = !!messageIdAssessment?.hasIssue;
+    if (messageIdIssue) {
+      const examples = messageIdAssessment.suspiciousIds?.length
+        ? `；异常示例：${messageIdAssessment.suspiciousIds.join('、')}`
+        : '';
+      reasons.unshift({
+        type: 'neg',
+        title: 'message ID 存疑：保真度存在问题',
+        detail: `${messageIdAssessment.suspicious}/${messageIdAssessment.total} 条成功响应的 message id 缺失或不符合已知格式（缺失 ${messageIdAssessment.missing}，未知 ${messageIdAssessment.unknown}）${examples}`
+      });
+      if (level === 'real' || level === 'unknown') level = 'suspicious';
+      if (level === 'suspicious') confidence = Math.min(confidence || 0.6, 0.6);
+    }
+
+    // 12. 强制 Claude 身份提示词判定（最高优先级）
+    // 当全部非零模型指纹都只指向 Claude 时，视为中转层注入了强制 Claude persona。
+    // 该规则按产品要求直接覆盖协议、渠道、性能及 Thinking Signature 等其他证据。
+    if (claudeOnlyFingerprint) {
+      const claudeFp = fpScores.find(fp => fp.id === 'claude') || topFp;
+      reasons.unshift({
+        type: 'neg',
+        title: '所有模型指纹均指向 Claude：判定为伪造',
+        detail: `仅 Claude 指纹产生有效得分（${claudeFp?.score || 0}），其他模型指纹全部为 0。判定上游加入了强制 Claude 身份提示词，无法将自报身份视为真实底座证据。`
+      });
+      level = 'fake';
+      confidence = 1;
+      detectedModel = claudeFp || detectedModel;
+    }
+
+    // 13. 身份回答固定模板判定（最高优先级）
+    // 同一模型面对多个身份问题始终逐字输出相同文本，视为上游强制注入固定身份回答。
+    const fixedIdentityResponse = !!fixedIdentityAnswers?.detected;
+    if (fixedIdentityResponse) {
+      const affected = fixedIdentityAnswers.models
+        .map(x => `${x.model}（${x.samples} 次）`)
+        .join('、');
+      reasons.unshift({
+        type: 'neg',
+        title: '身份探测回答每次完全相同：判定为伪造',
+        detail: `${affected} 对不同身份探测始终返回同一段固定文本，判定上游注入了强制身份提示词。固定回答示例：${fixedIdentityAnswers.models[0]?.response || ''}`
+      });
+      level = 'fake';
+      confidence = 1;
+    }
+
     // Title
     let title;
     switch (level) {
@@ -903,7 +1038,13 @@ const Analyzer = {
         title = `✅ 真实：声称的 ${claimedFp?.name || claimedModel} 与响应特征一致`;
         break;
       case 'fake':
-        title = `❌ 伪造：API 声称 ${claimedModel}，实际底座疑似 ${detectedModel?.name || '其他模型'}`;
+        title = claudeOnlyFingerprint && fixedIdentityResponse
+          ? '❌ 伪造：Claude 指纹单一且身份回答完全固定'
+          : fixedIdentityResponse
+            ? '❌ 伪造：身份探测回答每次完全相同'
+            : claudeOnlyFingerprint
+              ? '❌ 伪造：所有模型指纹均被强制指向 Claude'
+              : `❌ 伪造：API 声称 ${claimedModel}，实际底座疑似 ${detectedModel?.name || '其他模型'}`;
         break;
       case 'suspicious':
         title = `⚠️ 可疑：证据不足或存在矛盾，无法确认真实性`;
@@ -917,7 +1058,10 @@ const Analyzer = {
       confidence: +confidence.toFixed(2),
       title,
       reasons,
-      detectedModel
+      detectedModel,
+      claudeOnlyFingerprint,
+      fixedIdentityResponse,
+      messageIdIssue
     };
   }
 };
